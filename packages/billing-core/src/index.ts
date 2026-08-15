@@ -138,6 +138,7 @@ export interface LedgerFields {
   readonly eventAt: IsoTimestamp | null;
   readonly eventId: string | null;
   readonly snapshotAt: IsoTimestamp | null;
+  readonly snapshotGeneration: number;
   readonly reservationId: string | null;
   readonly reservationExpiresAt: IsoTimestamp | null;
   readonly reservationSeeded: boolean;
@@ -175,14 +176,15 @@ export interface WatermarkToken {
 
 /**
  * What a sweep observed before fetching provider truth: the watermark
- * identity plus the snapshot freshness bound already on the row.
+ * identity plus the snapshot freshness bound and write generation.
  *
- * Another reconciliation that lands first changes `snapshotAt` without
- * touching the watermark. Re-checking this bound is what drops the
- * slower, stale fetch.
+ * Another reconciliation that lands first increments `snapshotGeneration`
+ * without touching the watermark second. Re-checking that generation is
+ * what drops the slower, stale fetch.
  */
 export interface SnapshotObservation extends WatermarkToken {
   readonly snapshotAt: IsoTimestamp | null;
+  readonly snapshotGeneration: number;
 }
 
 /**
@@ -310,6 +312,7 @@ const CORE_FIELD_NAMES = new Set<string>([
   "eventAt",
   "eventId",
   "snapshotAt",
+  "snapshotGeneration",
   "reservationId",
   "reservationExpiresAt",
   "reservationSeeded",
@@ -576,28 +579,32 @@ function assertSweepLimit(limit: number): number {
   return limit;
 }
 
-/**
- * Every successful snapshot write must persist a strictly later
- * `snapshotAt` than the row already holds. Equality is not enough: two
- * reconciles that observed the same bound would both pass the CAS check
- * and the slower fetch could clobber fresher fields.
- */
-function advancingSnapshotAt(
-  current: IsoTimestamp | null,
-  incoming: IsoTimestamp,
+function laterTimestamp(
+  left: IsoTimestamp | null,
+  right: IsoTimestamp,
 ): IsoTimestamp {
-  if (current === null) {
-    return incoming;
+  if (left === null) {
+    return right;
   }
-  const currentMs = canonicalTimestampMilliseconds(current);
-  const incomingMs = canonicalTimestampMilliseconds(incoming);
-  if (currentMs === null) {
-    return incoming;
+  const leftMs = canonicalTimestampMilliseconds(left);
+  const rightMs = canonicalTimestampMilliseconds(right);
+  if (leftMs === null) {
+    return right;
   }
-  if (incomingMs !== null && incomingMs > currentMs) {
-    return incoming;
+  if (rightMs === null) {
+    return left;
   }
-  return addMilliseconds(current, 1);
+  return leftMs >= rightMs ? left : right;
+}
+
+function nextSnapshotGeneration(current: number): number {
+  return Number.isFinite(current) && current >= 0 ? Math.floor(current) + 1 : 1;
+}
+
+function storedSnapshotGeneration(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
 }
 
 /** Reads the domain CAS token from a ledger row. */
@@ -607,14 +614,18 @@ export function observeWatermark(
   return { eventAt: record.eventAt, eventId: record.eventId };
 }
 
-/** Reads the watermark and the snapshot freshness bound already on the row. */
+/** Reads the watermark, freshness bound, and snapshot write generation. */
 export function observeSnapshot(
-  record: Pick<LedgerFields, "eventAt" | "eventId" | "snapshotAt">,
+  record: Pick<
+    LedgerFields,
+    "eventAt" | "eventId" | "snapshotAt" | "snapshotGeneration"
+  >,
 ): SnapshotObservation {
   return {
     eventAt: record.eventAt,
     eventId: record.eventId,
     snapshotAt: record.snapshotAt,
+    snapshotGeneration: storedSnapshotGeneration(record.snapshotGeneration),
   };
 }
 
@@ -732,6 +743,7 @@ function blankLedgerRecord<TFields extends LedgerFieldMap>(
     eventAt: null,
     eventId: null,
     snapshotAt: null,
+    snapshotGeneration: 0,
     reservationId: null,
     reservationExpiresAt: null,
     reservationSeeded: false,
@@ -892,6 +904,7 @@ function projectAppliedRecord<THost extends HostFields>(
     eventAt: event.eventAt,
     eventId: event.eventId,
     snapshotAt: current?.snapshotAt ?? null,
+    snapshotGeneration: storedSnapshotGeneration(current?.snapshotGeneration),
     reservationId: granting ? null : (current?.reservationId ?? null),
     reservationExpiresAt: granting
       ? null
@@ -1031,7 +1044,8 @@ function projectSnapshotRecord<THost extends HostFields>(
     cancelAtPeriodEnd: snapshot.cancelAtPeriodEnd,
     eventAt: current.eventAt,
     eventId: current.eventId,
-    snapshotAt: advancingSnapshotAt(current.snapshotAt, snapshotAt),
+    snapshotAt: laterTimestamp(current.snapshotAt, snapshotAt),
+    snapshotGeneration: nextSnapshotGeneration(current.snapshotGeneration),
     reservationId: granting ? null : (current.reservationId ?? null),
     reservationExpiresAt: granting
       ? null
@@ -1048,15 +1062,16 @@ function projectSnapshotRecord<THost extends HostFields>(
  * The host must observe {@link SnapshotObservation} first, sample the
  * freshness bound, then fetch provider truth, then call this against
  * freshly read state. A watermark mismatch means an intervening event
- * landed; a `snapshotAt` mismatch means another reconciliation already
- * wrote. Either drops the snapshot. A reservation-only / eventless row
- * has no event identity to repair — refuse a `(null, null)` match so a
- * founding webhook is not gated by an invented bound.
+ * landed; a `snapshotGeneration` mismatch means another reconciliation
+ * already wrote. Either drops the snapshot. A reservation-only /
+ * eventless row has no event identity to repair — refuse a `(null, null)`
+ * match so a founding webhook is not gated by an invented bound.
  *
- * A match ALWAYS writes — even when no field changed — and `snapshotAt`
- * strictly advances so a same-bound overlapping sweep cannot clobber
- * fresher fields. A delayed intermediate webhook cannot land after a
- * no-op sweep. `eventAt` and `eventId` are copied from current state and
+ * A match ALWAYS writes — even when no field changed — and increments
+ * `snapshotGeneration` so a same-bound overlapping sweep cannot clobber
+ * fresher fields. `snapshotAt` never jumps into a later Unix second than
+ * the sampled bound, so same-second webhooks still get lifecycle-rank
+ * arbitration. `eventAt` and `eventId` are copied from current state and
  * never replaced.
  *
  * Host-declared `sticky` / `firstWins` fields are enforced on the write
@@ -1078,7 +1093,10 @@ export function decideLedgerSnapshot<THost extends HostFields = {}>(
   if (!watermarksMatch(current, observed)) {
     return { action: "keep", reason: "intervening-write" };
   }
-  if (current.snapshotAt !== observed.snapshotAt) {
+  if (
+    current.snapshotAt !== observed.snapshotAt ||
+    current.snapshotGeneration !== observed.snapshotGeneration
+  ) {
     return { action: "keep", reason: "superseded" };
   }
   return {
@@ -1110,6 +1128,7 @@ function encodeLedgerCore(
     eventAt: value.eventAt,
     eventId: value.eventId,
     snapshotAt: value.snapshotAt,
+    snapshotGeneration: storedSnapshotGeneration(value.snapshotGeneration),
     reservationId: value.reservationId,
     reservationExpiresAt: value.reservationExpiresAt,
     reservationSeeded: value.reservationSeeded,
@@ -1158,6 +1177,7 @@ function decodeLedgerRecord<THost extends HostFields>(
     eventAt: storedTimestamp(record["eventAt"]),
     eventId: toNullableString(record["eventId"]),
     snapshotAt: storedTimestamp(record["snapshotAt"]),
+    snapshotGeneration: storedSnapshotGeneration(record["snapshotGeneration"]),
     reservationId: toNullableString(record["reservationId"]),
     reservationExpiresAt: storedTimestamp(record["reservationExpiresAt"]),
     reservationSeeded: record["reservationSeeded"] === true,

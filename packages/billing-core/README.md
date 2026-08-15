@@ -77,14 +77,16 @@ on every conflict. A reservation id is minted inside the decider and read
 back from storage; the caller's id is whatever the stored record says.
 
 Snapshot reconciliation observes the domain CAS token `(eventAt, eventId)`
-and the current `snapshotAt`, samples the freshness bound from the injected
-clock, then fetches provider truth. The decider re-checks both the watermark
-and the observed `snapshotAt` against fresh state. An intervening event or a
-newer reconciliation drops the snapshot. A reservation-only row is skipped
-so a founding webhook is not gated by an invented bound. A token match
-always writes — even when no field changed — so `snapshotAt` advances and a
-delayed intermediate webhook cannot land after a no-op sweep. The watermark
-identity is never touched.
+and the current `snapshotAt` / `snapshotGeneration`, samples the freshness
+bound from the injected clock, then fetches provider truth. The decider
+re-checks the watermark and the observed generation against fresh state.
+An intervening event or a newer reconciliation drops the snapshot. A
+reservation-only row is skipped so a founding webhook is not gated by an
+invented bound. A token match always writes — even when no field changed —
+and increments `snapshotGeneration` so overlapping same-bound sweeps cannot
+clobber fresher fields. `snapshotAt` never jumps into a later Unix second
+than the sampled bound, so same-second webhooks still get lifecycle-rank
+arbitration. The watermark identity is never touched.
 
 Phase 3 is the arbitration core, combinators, reservation, and snapshot
 reconciliation. The Stripe adapter is a later phase — do not import it

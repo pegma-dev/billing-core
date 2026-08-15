@@ -136,6 +136,7 @@ function record(
     eventAt: SECOND,
     eventId: "evt_seed",
     snapshotAt: null,
+    snapshotGeneration: 0,
     reservationId: null,
     reservationExpiresAt: null,
     reservationSeeded: false,
@@ -797,6 +798,7 @@ describe("billing ledger codec", () => {
       eventAt: SECOND,
       eventId: "evt_seed",
       snapshotAt: null,
+      snapshotGeneration: 0,
       reservationId: null,
       reservationExpiresAt: null,
       reservationSeeded: false,
@@ -1448,6 +1450,7 @@ describe("declared invariants", () => {
       eventAt: SECOND,
       eventId: "evt_seed",
       snapshotAt: null,
+      snapshotGeneration: 0,
       reservationId: null,
       reservationExpiresAt: null,
       reservationSeeded: false,
@@ -1649,6 +1652,7 @@ describe("snapshot decider", () => {
         eventId: "evt_seed",
         eventAt: SECOND,
         snapshotAt: SNAPSHOT_BOUND,
+        snapshotGeneration: 1,
         status: "active",
         plan: "pro",
       },
@@ -1680,7 +1684,12 @@ describe("snapshot decider", () => {
     expect(
       decideLedgerSnapshot(
         record("acct", { eventId: "evt_newer", eventAt: LATER }),
-        { eventAt: SECOND, eventId: "evt_seed", snapshotAt: null },
+        {
+          eventAt: SECOND,
+          eventId: "evt_seed",
+          snapshotAt: null,
+          snapshotGeneration: 0,
+        },
         snapshot({ plan: "should-not-land" }),
         SNAPSHOT_BOUND,
       ),
@@ -1691,7 +1700,12 @@ describe("snapshot decider", () => {
     expect(
       decideLedgerSnapshot(
         null,
-        { eventAt: SECOND, eventId: "evt_seed", snapshotAt: null },
+        {
+          eventAt: SECOND,
+          eventId: "evt_seed",
+          snapshotAt: null,
+          snapshotGeneration: 0,
+        },
         snapshot(),
         SNAPSHOT_BOUND,
       ),
@@ -1709,13 +1723,14 @@ describe("snapshot decider", () => {
     expect(decision).toMatchObject({
       action: "write",
       value: {
-        snapshotAt: "2026-08-15T16:05:00.001Z",
+        snapshotAt: SNAPSHOT_BOUND,
+        snapshotGeneration: 1,
         eventId: "evt_seed",
       },
     });
   });
 
-  it("strictly advances snapshotAt on a same-bound write so the next CAS drops", () => {
+  it("increments snapshotGeneration on a same-bound write so the next CAS drops", () => {
     const current = record("acct", { snapshotAt: SECOND, plan: "fresh" });
     const first = decideLedgerSnapshot(
       current,
@@ -1725,7 +1740,11 @@ describe("snapshot decider", () => {
     );
     expect(first).toMatchObject({
       action: "write",
-      value: { snapshotAt: "2026-08-15T16:00:00.001Z", plan: "fresh" },
+      value: {
+        snapshotAt: SECOND,
+        snapshotGeneration: 1,
+        plan: "fresh",
+      },
     });
     if (first.action !== "write") {
       return;
@@ -1798,7 +1817,12 @@ describe("snapshot decider", () => {
     expect(
       decideLedgerSnapshot(
         record("acct", { snapshotAt: SNAPSHOT_BOUND, plan: "fresh" }),
-        { eventAt: SECOND, eventId: "evt_seed", snapshotAt: null },
+        {
+          eventAt: SECOND,
+          eventId: "evt_seed",
+          snapshotAt: null,
+          snapshotGeneration: 0,
+        },
         snapshot({ plan: "stale-fetch" }),
         SECOND,
       ),
@@ -2013,7 +2037,8 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
       if (!fast.written) {
         throw new Error("expected fast snapshot write");
       }
-      expect(fast.record.snapshotAt).toBe("2026-08-15T16:00:00.001Z");
+      expect(fast.record.snapshotAt).toBe(SECOND);
+      expect(fast.record.snapshotGeneration).toBe(2);
       releaseSlow();
       expect(await slow).toMatchObject({
         written: false,
@@ -2023,7 +2048,74 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
         plan: "fresh-truth",
         status: "canceled",
         eventId: "evt_seed",
-        snapshotAt: "2026-08-15T16:00:00.001Z",
+        snapshotAt: SECOND,
+        snapshotGeneration: 2,
+      });
+    });
+
+    it("overlapping .999Z reconcile does not stale a same-second webhook", async () => {
+      const endOfSecond = "2026-08-15T16:00:00.999Z";
+      const clock = controllableClock(endOfSecond);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_end_of_second",
+        event("evt_applied", { eventAt: SECOND, status: "active" }),
+      );
+      const seeded = await ledger.reconcile("acct_end_of_second", async () =>
+        snapshot({ status: "active" }),
+      );
+      expect(seeded.written).toBe(true);
+      if (!seeded.written) {
+        throw new Error("expected seed snapshot write");
+      }
+      expect(seeded.record.snapshotAt).toBe(endOfSecond);
+      expect(effectiveWatermarkSecond(seeded.record)).toBe(unixSecond(SECOND));
+
+      let releaseSlow = () => {};
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      let slowStarted = () => {};
+      const slowIsFetching = new Promise<void>((resolve) => {
+        slowStarted = resolve;
+      });
+
+      const slow = ledger.reconcile("acct_end_of_second", async () => {
+        slowStarted();
+        await slowGate;
+        return snapshot({ plan: "stale-fetch", status: "active" });
+      });
+      await slowIsFetching;
+
+      const fast = await ledger.reconcile("acct_end_of_second", async () =>
+        snapshot({ plan: "fresh-truth", status: "active" }),
+      );
+      expect(fast.written).toBe(true);
+      if (!fast.written) {
+        throw new Error("expected fast snapshot write");
+      }
+      expect(fast.record.snapshotAt).toBe(endOfSecond);
+      expect(effectiveWatermarkSecond(fast.record)).toBe(unixSecond(SECOND));
+      releaseSlow();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+
+      const canceled = await ledger.apply(
+        "acct_end_of_second",
+        event("evt_canceled", {
+          eventAt: SAME_SECOND_LATER_MS,
+          status: "canceled",
+        }),
+      );
+      expect(canceled.applied).toBe(true);
+      expect(canceled.record).toMatchObject({
+        status: "canceled",
+        eventId: "evt_canceled",
+        eventAt: SAME_SECOND_LATER_MS,
+        snapshotAt: endOfSecond,
       });
     });
 
