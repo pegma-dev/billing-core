@@ -51,10 +51,6 @@ export function isGrantingStatus(status: LifecycleStatus): boolean {
   return lifecycleRank(status) === LIFECYCLE_RANK.active;
 }
 
-function isTerminalStatus(status: LifecycleStatus): boolean {
-  return lifecycleRank(status) === LIFECYCLE_RANK.canceled;
-}
-
 function offerIsRedeemed(
   current: Pick<LedgerFields, "offerRedeemed" | "status"> | null,
   event: Pick<LedgerEvent, "offerRedeemed" | "status">,
@@ -62,13 +58,10 @@ function offerIsRedeemed(
   if (current?.offerRedeemed === true || event.offerRedeemed === true) {
     return true;
   }
-  if (
-    current !== null &&
-    (isGrantingStatus(current.status) || isTerminalStatus(current.status))
-  ) {
-    return true;
-  }
-  return isGrantingStatus(event.status) || isTerminalStatus(event.status);
+  return (
+    (current !== null && isGrantingStatus(current.status)) ||
+    isGrantingStatus(event.status)
+  );
 }
 
 /** Values a host-declared ledger field may persist. */
@@ -815,7 +808,7 @@ export function decideReservation<THost extends HostFields = {}>(
     current === null
       ? (blankLedgerRecord(accountId, invariants) as LedgerRecord<THost>)
       : current;
-  if (base.offerRedeemed || isTerminalStatus(base.status)) {
+  if (base.offerRedeemed) {
     return { action: "keep", reason: "redeemed" };
   }
   if (isGrantingStatus(base.status)) {

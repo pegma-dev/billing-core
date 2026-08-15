@@ -1287,6 +1287,39 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       });
     });
 
+    it("allows reserve after a terminal event that never granted", async () => {
+      const clock = controllableClock(SECOND);
+      const ledger = createBillingLedger({ store: freshStore(), clock });
+      const canceled = await ledger.apply(
+        "acct_never_granted",
+        event("evt_canceled", { status: "canceled" }),
+      );
+      expect(canceled.applied).toBe(true);
+      expect(canceled.record.offerRedeemed).toBe(false);
+      expect(await ledger.reserve("acct_never_granted")).toMatchObject({
+        reserved: true,
+      });
+
+      const reserved = await ledger.reserve("acct_abandoned_cancel");
+      expect(reserved.reserved).toBe(true);
+      if (!reserved.reserved) {
+        throw new Error("expected a reservation");
+      }
+      const terminal = await ledger.apply(
+        "acct_abandoned_cancel",
+        event("evt_unpaid", { status: "unpaid" }),
+      );
+      expect(terminal.applied).toBe(true);
+      expect(terminal.record.offerRedeemed).toBe(false);
+      expect(terminal.record.reservationId).toBe(reserved.reservationId);
+      expect(
+        await ledger.release("acct_abandoned_cancel", reserved.reservationId),
+      ).toEqual({ released: true });
+      expect(await ledger.reserve("acct_abandoned_cancel")).toMatchObject({
+        reserved: true,
+      });
+    });
+
     it("redeems a Phase 1 live row when a later non-granting event applies", async () => {
       const store = freshStore();
       await store.collection(billingLedgerCollection()).put(
@@ -1490,7 +1523,10 @@ describe("checkout reservation decider", () => {
         "rsv_new",
         LATER,
       ),
-    ).toEqual({ action: "keep", reason: "redeemed" });
+    ).toMatchObject({
+      action: "write",
+      value: { reservationId: "rsv_new", offerRedeemed: false },
+    });
     expect(
       decideReservation(
         record("acct", { status: "trialing" }),
