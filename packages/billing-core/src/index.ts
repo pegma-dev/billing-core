@@ -174,6 +174,18 @@ export interface WatermarkToken {
 }
 
 /**
+ * What a sweep observed before fetching provider truth: the watermark
+ * identity plus the snapshot freshness bound already on the row.
+ *
+ * Another reconciliation that lands first changes `snapshotAt` without
+ * touching the watermark. Re-checking this bound is what drops the
+ * slower, stale fetch.
+ */
+export interface SnapshotObservation extends WatermarkToken {
+  readonly snapshotAt: IsoTimestamp | null;
+}
+
+/**
  * Provider truth used to repair field drift. It does not carry a watermark;
  * applying it must not change `eventAt` or `eventId`.
  */
@@ -230,7 +242,7 @@ export interface ReleaseResult {
 }
 
 export type SnapshotIgnoreReason =
-  "missing" | "unavailable" | "intervening-write";
+  "missing" | "unavailable" | "eventless" | "intervening-write" | "superseded";
 
 export type SnapshotDecision<THost extends HostFields = {}> =
   | { readonly action: "write"; readonly value: LedgerRecord<THost> }
@@ -589,6 +601,17 @@ export function observeWatermark(
   return { eventAt: record.eventAt, eventId: record.eventId };
 }
 
+/** Reads the watermark and the snapshot freshness bound already on the row. */
+export function observeSnapshot(
+  record: Pick<LedgerFields, "eventAt" | "eventId" | "snapshotAt">,
+): SnapshotObservation {
+  return {
+    eventAt: record.eventAt,
+    eventId: record.eventId,
+    snapshotAt: record.snapshotAt,
+  };
+}
+
 export function watermarksMatch(
   current: Pick<LedgerFields, "eventAt" | "eventId">,
   observed: WatermarkToken,
@@ -596,6 +619,12 @@ export function watermarksMatch(
   return (
     current.eventAt === observed.eventAt && current.eventId === observed.eventId
   );
+}
+
+export function hasEventWatermark(
+  record: Pick<LedgerFields, "eventAt" | "eventId">,
+): boolean {
+  return record.eventAt !== null && record.eventId !== null;
 }
 
 function assertEvent<THost extends HostFields>(
@@ -1010,19 +1039,25 @@ function projectSnapshotRecord<THost extends HostFields>(
 /**
  * Decides whether a provider snapshot may repair the current ledger row.
  *
- * The host must observe {@link WatermarkToken} first, then fetch provider
- * truth, then call this against freshly read state. A token mismatch means
- * an intervening write landed; drop the snapshot. A match ALWAYS writes —
- * even when no field changed — so `snapshotAt` advances and a delayed
- * intermediate webhook cannot land after a no-op sweep. `eventAt` and
- * `eventId` are copied from current state and never replaced.
+ * The host must observe {@link SnapshotObservation} first, sample the
+ * freshness bound, then fetch provider truth, then call this against
+ * freshly read state. A watermark mismatch means an intervening event
+ * landed; a `snapshotAt` mismatch means another reconciliation already
+ * wrote. Either drops the snapshot. A reservation-only / eventless row
+ * has no event identity to repair — refuse a `(null, null)` match so a
+ * founding webhook is not gated by an invented bound.
+ *
+ * A match ALWAYS writes — even when no field changed — so `snapshotAt`
+ * advances and a delayed intermediate webhook cannot land after a no-op
+ * sweep. `eventAt` and `eventId` are copied from current state and never
+ * replaced.
  *
  * Host-declared `sticky` / `firstWins` fields are enforced on the write
  * against the freshly read row.
  */
 export function decideLedgerSnapshot<THost extends HostFields = {}>(
   current: LedgerRecord<THost> | null,
-  observed: WatermarkToken,
+  observed: SnapshotObservation,
   snapshot: LedgerSnapshot<THost>,
   snapshotAt: IsoTimestamp,
   invariants?: LedgerInvariants<THost>,
@@ -1030,8 +1065,14 @@ export function decideLedgerSnapshot<THost extends HostFields = {}>(
   if (current === null) {
     return { action: "keep", reason: "missing" };
   }
+  if (isEventlessLedgerRow(current) || !hasEventWatermark(current)) {
+    return { action: "keep", reason: "eventless" };
+  }
   if (!watermarksMatch(current, observed)) {
     return { action: "keep", reason: "intervening-write" };
+  }
+  if (current.snapshotAt !== observed.snapshotAt) {
+    return { action: "keep", reason: "superseded" };
   }
   return {
     action: "write",
@@ -1175,7 +1216,16 @@ export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
       });
       return { written: false, record: null, reason: "missing" };
     }
-    const token = observeWatermark(observed);
+    if (isEventlessLedgerRow(observed) || !hasEventWatermark(observed)) {
+      logger.log("info", "Billing ledger snapshot ignored", {
+        accountId,
+        eventId: observed.eventId,
+        written: false,
+      });
+      return { written: false, record: observed, reason: "eventless" };
+    }
+    const token = observeSnapshot(observed);
+    const snapshotAt = assertClockNow(clock);
     const fetched = await fetchSnapshot(observed);
     if (fetched === null) {
       logger.log("info", "Billing ledger snapshot ignored", {
@@ -1186,10 +1236,21 @@ export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
       return { written: false, record: observed, reason: "unavailable" };
     }
     const snapshot = assertSnapshot(fetched);
-    const snapshotAt = assertClockNow(clock);
-    const result = await rows.update(billingLedgerKey(accountId), (current) =>
-      decideLedgerSnapshot(current, token, snapshot, snapshotAt, invariants),
-    );
+    let ignore: SnapshotIgnoreReason | undefined;
+    const result = await rows.update(billingLedgerKey(accountId), (current) => {
+      const decision = decideLedgerSnapshot(
+        current,
+        token,
+        snapshot,
+        snapshotAt,
+        invariants,
+      );
+      if (decision.action === "keep") {
+        ignore = decision.reason;
+        return { action: "keep" as const };
+      }
+      return decision;
+    });
     const written = result.written;
     logger.log(
       "info",
@@ -1213,7 +1274,7 @@ export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
     return {
       written: false,
       record: result.value,
-      reason: result.value === null ? "missing" : "intervening-write",
+      reason: ignore ?? "intervening-write",
     };
   }
 

@@ -35,6 +35,7 @@ import {
   isGrantingStatus,
   LIFECYCLE_RANK,
   lifecycleRank,
+  observeSnapshot,
   observeWatermark,
   reservationIsLive,
   sticky,
@@ -1638,7 +1639,7 @@ describe("snapshot decider", () => {
     const current = record("acct", { snapshotAt: null });
     const decision = decideLedgerSnapshot(
       current,
-      observeWatermark(current),
+      observeSnapshot(current),
       snapshot(),
       SNAPSHOT_BOUND,
     );
@@ -1658,7 +1659,7 @@ describe("snapshot decider", () => {
     const current = record("acct", { plan: "stale", snapshotAt: EARLIER });
     const decision = decideLedgerSnapshot(
       current,
-      observeWatermark(current),
+      observeSnapshot(current),
       snapshot({ plan: "pro", status: "past_due" }),
       SNAPSHOT_BOUND,
     );
@@ -1679,7 +1680,7 @@ describe("snapshot decider", () => {
     expect(
       decideLedgerSnapshot(
         record("acct", { eventId: "evt_newer", eventAt: LATER }),
-        { eventAt: SECOND, eventId: "evt_seed" },
+        { eventAt: SECOND, eventId: "evt_seed", snapshotAt: null },
         snapshot({ plan: "should-not-land" }),
         SNAPSHOT_BOUND,
       ),
@@ -1690,7 +1691,7 @@ describe("snapshot decider", () => {
     expect(
       decideLedgerSnapshot(
         null,
-        { eventAt: SECOND, eventId: "evt_seed" },
+        { eventAt: SECOND, eventId: "evt_seed", snapshotAt: null },
         snapshot(),
         SNAPSHOT_BOUND,
       ),
@@ -1701,7 +1702,7 @@ describe("snapshot decider", () => {
     const current = record("acct", { snapshotAt: SNAPSHOT_BOUND });
     const decision = decideLedgerSnapshot(
       current,
-      observeWatermark(current),
+      observeSnapshot(current),
       snapshot(),
       SECOND,
     );
@@ -1720,7 +1721,7 @@ describe("snapshot decider", () => {
     };
     const decision = decideLedgerSnapshot(
       current,
-      observeWatermark(current),
+      observeSnapshot(current),
       snapshot({
         fields: {
           foundingMember: false,
@@ -1740,6 +1741,40 @@ describe("snapshot decider", () => {
         eventId: "evt_seed",
       },
     });
+  });
+
+  it("refuses a (null, null) token match on an eventless row", () => {
+    const reserved = decideReservation(
+      null,
+      "acct_blank",
+      SECOND,
+      "rsv_1",
+      LATER,
+    );
+    expect(reserved.action).toBe("write");
+    if (reserved.action !== "write") {
+      return;
+    }
+    expect(isEventlessLedgerRow(reserved.value)).toBe(true);
+    expect(
+      decideLedgerSnapshot(
+        reserved.value,
+        observeSnapshot(reserved.value),
+        snapshot({ status: "active", plan: "invented" }),
+        SNAPSHOT_BOUND,
+      ),
+    ).toEqual({ action: "keep", reason: "eventless" });
+  });
+
+  it("drops a snapshot superseded by a newer snapshotAt on the same event token", () => {
+    expect(
+      decideLedgerSnapshot(
+        record("acct", { snapshotAt: SNAPSHOT_BOUND, plan: "fresh" }),
+        { eventAt: SECOND, eventId: "evt_seed", snapshotAt: null },
+        snapshot({ plan: "stale-fetch" }),
+        SECOND,
+      ),
+    ).toEqual({ action: "keep", reason: "superseded" });
   });
 
   it("treats (eventAt, eventId) as the token, not a storage version", () => {
@@ -1870,6 +1905,122 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
         plan: "pro",
       });
       expect(await ledger.get("acct_noop_sweep")).toEqual(result.record);
+    });
+
+    it("samples snapshotAt before fetch so a later cancel webhook can still apply", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_bound_before_fetch",
+        event("evt_applied", { eventAt: EARLIER, status: "active" }),
+      );
+
+      const swept = await ledger.reconcile(
+        "acct_bound_before_fetch",
+        async () => {
+          clock.set(SNAPSHOT_BOUND);
+          return snapshot({ status: "active" });
+        },
+      );
+      expect(swept.written).toBe(true);
+      if (!swept.written) {
+        throw new Error("expected snapshot write");
+      }
+      expect(swept.record.snapshotAt).toBe(SECOND);
+
+      const canceled = await ledger.apply(
+        "acct_bound_before_fetch",
+        event("evt_canceled", {
+          eventAt: LATER,
+          status: "canceled",
+        }),
+      );
+      expect(canceled.applied).toBe(true);
+      expect(canceled.record).toMatchObject({
+        status: "canceled",
+        eventId: "evt_canceled",
+        eventAt: LATER,
+        snapshotAt: SECOND,
+      });
+    });
+
+    it("overlapping sweep does not clobber a newer snapshot", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_overlap",
+        event("evt_seed", { plan: "original" }),
+      );
+
+      let releaseSlow = () => {};
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      let slowStarted = () => {};
+      const slowIsFetching = new Promise<void>((resolve) => {
+        slowStarted = resolve;
+      });
+
+      const slow = ledger.reconcile("acct_overlap", async () => {
+        slowStarted();
+        await slowGate;
+        return snapshot({ plan: "stale-fetch", status: "active" });
+      });
+      await slowIsFetching;
+
+      clock.set(SNAPSHOT_BOUND);
+      const fast = await ledger.reconcile("acct_overlap", async () =>
+        snapshot({ plan: "fresh-truth", status: "canceled" }),
+      );
+      expect(fast.written).toBe(true);
+      releaseSlow();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+      expect(await ledger.get("acct_overlap")).toMatchObject({
+        plan: "fresh-truth",
+        status: "canceled",
+        eventId: "evt_seed",
+        snapshotAt: SNAPSHOT_BOUND,
+      });
+    });
+
+    it("does not snapshot a reservation-only row so a founding webhook can still apply", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      const reserved = await ledger.reserve("acct_eventless_snap");
+      expect(reserved.reserved).toBe(true);
+
+      let fetched = 0;
+      const result = await ledger.reconcile("acct_eventless_snap", async () => {
+        fetched += 1;
+        return snapshot({ status: "active", plan: "invented" });
+      });
+      expect(result).toMatchObject({
+        written: false,
+        reason: "eventless",
+      });
+      expect(fetched).toBe(0);
+      const held = await ledger.get("acct_eventless_snap");
+      expect(held && isEventlessLedgerRow(held)).toBe(true);
+      expect(held?.snapshotAt).toBeNull();
+      expect(held?.plan).toBeNull();
+
+      const founding = await ledger.apply(
+        "acct_eventless_snap",
+        event("evt_founding", { eventAt: EARLIER, status: "active" }),
+      );
+      expect(founding.applied).toBe(true);
+      expect(founding.record).toMatchObject({
+        eventId: "evt_founding",
+        eventAt: EARLIER,
+        status: "active",
+        snapshotAt: null,
+      });
     });
 
     it("fetches provider truth only after observing the watermark", async () => {
