@@ -1080,8 +1080,15 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         reason: "reserved",
       });
 
-      await ledger.apply("acct_sub", event("evt_active"));
-      expect(await ledger.reserve("acct_sub")).toEqual({
+      const subscribedStore = freshStore();
+      await subscribedStore
+        .collection(billingLedgerCollection())
+        .put(record("acct_sub", { status: "active", offerRedeemed: false }));
+      expect(
+        await createBillingLedger({ store: subscribedStore, clock }).reserve(
+          "acct_sub",
+        ),
+      ).toEqual({
         reserved: false,
         reason: "subscribed",
       });
