@@ -246,6 +246,17 @@ packages:
     expect(parseNpmJsonStdout(JSON.stringify(packed))).toEqual(packed);
     expect(() => parseNpmJsonStdout(banner)).toThrow("npm did not write JSON");
   });
+
+  it("parses npm view dist.integrity --json scalar stdout", () => {
+    expect(parseNpmJsonStdout('"sha512-abc"')).toBe("sha512-abc");
+    expect(parseNpmJsonStdout('  "sha512-abc"\n')).toBe("sha512-abc");
+    expect(parseNpmJsonStdout(JSON.stringify("sha512-abc"))).toBe("sha512-abc");
+    expect(parseNpmJsonStdout("0")).toBe(0);
+    expect(parseNpmJsonStdout("-2.5")).toBe(-2.5);
+    expect(parseNpmJsonStdout("true")).toBe(true);
+    expect(parseNpmJsonStdout("false")).toBe(false);
+    expect(parseNpmJsonStdout("null")).toBe(null);
+  });
 });
 
 describe("release source authentication", () => {

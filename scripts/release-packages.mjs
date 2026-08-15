@@ -102,20 +102,28 @@ function runNpm(arguments_, options = {}) {
 }
 
 /**
- * `npm --json` writes a JSON value. Lifecycle scripts invoked during
- * `npm pack` (including a package `prepack` of `pnpm run build`) may
- * print a human banner on the same stdout:
+ * `npm --json` writes a JSON value: objects, arrays, or scalars
+ * (`"sha512-…"`, numbers, true/false/null). Lifecycle scripts invoked
+ * during `npm pack` may print a human banner on the same stdout:
  *   > @pegma/...@0.1.1 build /home/runner/work/...
- * Parse from the first JSON token so that banner is never fed to
- * JSON.parse.
+ * Drop those `>` lines, then parse from the first JSON token so the
+ * banner is never fed to JSON.parse and `npm view dist.integrity --json`
+ * still yields a string.
  */
+const JSON_VALUE_START =
+  /[\[{"]|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b/u;
+
 export function parseNpmJsonStdout(stdout) {
   const text = typeof stdout === "string" ? stdout : "";
-  const start = text.search(/[\[{]/u);
+  const withoutBanners = text
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*>/u.test(line))
+    .join("\n");
+  const start = withoutBanners.search(JSON_VALUE_START);
   if (start === -1) {
     fail("npm did not write JSON output");
   }
-  return JSON.parse(text.slice(start));
+  return JSON.parse(withoutBanners.slice(start));
 }
 
 function unquoteYamlScalar(value) {
