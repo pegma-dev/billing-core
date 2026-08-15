@@ -27,6 +27,7 @@ import {
   DEFAULT_RESERVATION_TTL_MS,
   effectiveWatermarkSecond,
   firstWins,
+  hasReservationProvenance,
   type HostFromInvariants,
   isEventlessLedgerRow,
   isGrantingStatus,
@@ -113,6 +114,7 @@ function record(
     snapshotAt: null,
     reservationId: null,
     reservationExpiresAt: null,
+    reservationSeeded: false,
     offerRedeemed: false,
     ...overrides,
   };
@@ -773,8 +775,33 @@ describe("billing ledger codec", () => {
       snapshotAt: null,
       reservationId: null,
       reservationExpiresAt: null,
+      reservationSeeded: false,
       offerRedeemed: false,
     });
+  });
+
+  it("does not treat a blank unknown-status decode as reservation provenance", () => {
+    const decoded = codec.decode({
+      accountId: "acct_unknown_blank",
+      status: "unknown",
+    });
+    expect(decoded).toMatchObject({
+      status: "incomplete",
+      reservationSeeded: false,
+      reservationId: null,
+      reservationExpiresAt: null,
+      eventAt: null,
+      eventId: null,
+    });
+    expect(hasReservationProvenance(decoded)).toBe(false);
+    expect(isEventlessLedgerRow(decoded)).toBe(false);
+    expect(
+      decideLedgerApplication(
+        decoded,
+        "acct_unknown_blank",
+        event("evt_granting_arrival", { status: "active" }),
+      ),
+    ).toEqual({ action: "keep", reason: "stale" });
   });
 
   it("decodes unknown status to incomplete so a corrupt row cannot grant", () => {
@@ -1154,9 +1181,21 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       });
       const again = await ledger.reserve("acct_release");
       expect(again.reserved).toBe(true);
-      if (again.reserved) {
-        expect(again.reservationId).not.toBe(minted.reservationId);
+      if (!again.reserved) {
+        throw new Error("expected a second reservation");
       }
+      expect(again.reservationId).not.toBe(minted.reservationId);
+      expect(await ledger.release("acct_release", again.reservationId)).toEqual(
+        {
+          released: true,
+        },
+      );
+      const firstEvent = await ledger.apply(
+        "acct_release",
+        event("evt_after_release", { status: "incomplete" }),
+      );
+      expect(firstEvent.applied).toBe(true);
+      expect(firstEvent.record.reservationSeeded).toBe(true);
     });
 
     it("applies the first event onto a reservation-only row and keeps the reservation until granting", async () => {
@@ -1185,6 +1224,91 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         offerRedeemed: true,
         reservationId: null,
         reservationExpiresAt: null,
+      });
+    });
+
+    it("does not treat a blank decoded corrupt row as reservation-only", async () => {
+      const store = freshStore();
+      const rows = store.collection(billingLedgerCollection());
+      const decoded = billingLedgerCollection().codec.decode({
+        accountId: "acct_unknown_blank",
+        status: "unknown",
+      });
+      expect(hasReservationProvenance(decoded)).toBe(false);
+      expect(isEventlessLedgerRow(decoded)).toBe(false);
+      await rows.put(decoded);
+      const ledger = createBillingLedger({
+        store,
+        clock: controllableClock(SECOND),
+      });
+      const result = await ledger.apply(
+        "acct_unknown_blank",
+        event("evt_granting_arrival", { status: "active", plan: "resurrect" }),
+      );
+      expect(result.applied).toBe(false);
+      expect(result.record).toMatchObject({
+        status: "incomplete",
+        eventAt: null,
+        eventId: null,
+        plan: null,
+      });
+    });
+
+    it("firstWins keeps an empty-string first write under a later event", async () => {
+      const store = freshStore();
+      const rows = store.collection(billingLedgerCollection(HOST_FIELDS));
+      await rows.put({
+        ...record("acct_empty_first", {
+          eventAt: EARLIER,
+          eventId: "evt_seed",
+          status: "incomplete",
+          offerRedeemed: false,
+        }),
+        foundingMember: false,
+        consentAt: "",
+        consentVersion: "",
+      });
+      const ledger = createBillingLedger({
+        store,
+        fields: HOST_FIELDS,
+      });
+      const later = await ledger.apply(
+        "acct_empty_first",
+        event("evt_consent_later", {
+          eventAt: LATER,
+          status: "active",
+          fields: { consentAt: LATER, consentVersion: "later" },
+        }),
+      );
+      expect(later.applied).toBe(true);
+      expect(later.record).toMatchObject({
+        consentAt: "",
+        consentVersion: "",
+      });
+    });
+
+    it("redeems a Phase 1 live row when a later non-granting event applies", async () => {
+      const store = freshStore();
+      await store.collection(billingLedgerCollection()).put(
+        record("acct_phase1", {
+          status: "active",
+          offerRedeemed: false,
+          reservationSeeded: false,
+        }),
+      );
+      const ledger = createBillingLedger({
+        store,
+        clock: controllableClock(SECOND),
+      });
+      const canceled = await ledger.apply(
+        "acct_phase1",
+        event("evt_canceled", { eventAt: LATER, status: "canceled" }),
+      );
+      expect(canceled.applied).toBe(true);
+      expect(canceled.record.offerRedeemed).toBe(true);
+      expect(await ledger.reserve("acct_phase1")).toEqual({
+        reserved: false,
+        reason: "redeemed",
       });
     });
 
@@ -1269,11 +1393,26 @@ describe("declared invariants", () => {
       snapshotAt: null,
       reservationId: null,
       reservationExpiresAt: null,
+      reservationSeeded: false,
       offerRedeemed: false,
       foundingMember: true,
       consentAt: SECOND,
       consentVersion: "v1",
     });
+  });
+
+  it("rejects declared host fields that would persist forbidden data", () => {
+    for (const name of ["amount", "cardData", "rawPayload", "lineItems"]) {
+      expect(() => billingLedgerCollection({ [name]: firstWins() })).toThrow(
+        /card data, raw payloads, line items, or amounts/,
+      );
+    }
+    expect(() =>
+      createBillingLedger({
+        store: createMemoryStore(),
+        fields: { amount: sticky() },
+      }),
+    ).toThrow(/card data, raw payloads, line items, or amounts/);
   });
 
   it("re-evaluates sticky and firstWins against fresh current state", () => {
@@ -1311,6 +1450,25 @@ describe("declared invariants", () => {
       consentVersion: "v1",
     });
   });
+
+  it("firstWins freezes an empty-string first write", () => {
+    expect(
+      applyLedgerInvariants<Host>(
+        {
+          ...record("acct"),
+          foundingMember: false,
+          consentAt: "",
+          consentVersion: "",
+        },
+        { consentAt: LATER, consentVersion: "later" },
+        HOST_FIELDS,
+      ),
+    ).toEqual({
+      foundingMember: false,
+      consentAt: "",
+      consentVersion: "",
+    });
+  });
 });
 
 describe("checkout reservation decider", () => {
@@ -1318,6 +1476,15 @@ describe("checkout reservation decider", () => {
     expect(
       decideReservation(
         record("acct", { offerRedeemed: true }),
+        "acct",
+        SECOND,
+        "rsv_new",
+        LATER,
+      ),
+    ).toEqual({ action: "keep", reason: "redeemed" });
+    expect(
+      decideReservation(
+        record("acct", { status: "canceled", offerRedeemed: false }),
         "acct",
         SECOND,
         "rsv_new",
@@ -1384,6 +1551,7 @@ describe("checkout reservation decider", () => {
     if (reserved.action !== "write") {
       return;
     }
+    expect(hasReservationProvenance(reserved.value)).toBe(true);
     expect(isEventlessLedgerRow(reserved.value)).toBe(true);
     expect(
       decideLedgerApplication(

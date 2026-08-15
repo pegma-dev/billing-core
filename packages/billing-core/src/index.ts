@@ -51,6 +51,26 @@ export function isGrantingStatus(status: LifecycleStatus): boolean {
   return lifecycleRank(status) === LIFECYCLE_RANK.active;
 }
 
+function isTerminalStatus(status: LifecycleStatus): boolean {
+  return lifecycleRank(status) === LIFECYCLE_RANK.canceled;
+}
+
+function offerIsRedeemed(
+  current: Pick<LedgerFields, "offerRedeemed" | "status"> | null,
+  event: Pick<LedgerEvent, "offerRedeemed" | "status">,
+): boolean {
+  if (current?.offerRedeemed === true || event.offerRedeemed === true) {
+    return true;
+  }
+  if (
+    current !== null &&
+    (isGrantingStatus(current.status) || isTerminalStatus(current.status))
+  ) {
+    return true;
+  }
+  return isGrantingStatus(event.status) || isTerminalStatus(event.status);
+}
+
 /** Values a host-declared ledger field may persist. */
 export type HostFieldValue = string | number | boolean | null;
 
@@ -123,6 +143,7 @@ export interface LedgerFields {
   readonly snapshotAt: IsoTimestamp | null;
   readonly reservationId: string | null;
   readonly reservationExpiresAt: IsoTimestamp | null;
+  readonly reservationSeeded: boolean;
   readonly offerRedeemed: boolean;
 }
 
@@ -217,8 +238,32 @@ const CORE_FIELD_NAMES = new Set<string>([
   "snapshotAt",
   "reservationId",
   "reservationExpiresAt",
+  "reservationSeeded",
   "offerRedeemed",
 ]);
+
+const FORBIDDEN_HOST_FIELD_NAMES = new Set([
+  "amount",
+  "amounts",
+  "card",
+  "cards",
+  "carddata",
+  "cardnumber",
+  "card_data",
+  "card_number",
+  "payload",
+  "payloads",
+  "rawpayload",
+  "raw_payload",
+  "lineitem",
+  "lineitems",
+  "line_item",
+  "line_items",
+]);
+
+function isForbiddenHostFieldName(name: string): boolean {
+  return FORBIDDEN_HOST_FIELD_NAMES.has(name.toLowerCase());
+}
 
 function assertSafeAccountId(accountId: string): string {
   if (typeof accountId !== "string" || !SAFE_KEY_PART.test(accountId)) {
@@ -252,6 +297,11 @@ function assertHostFieldNames(fields: LedgerFieldMap | undefined): void {
     return;
   }
   for (const name of Object.keys(fields)) {
+    if (isForbiddenHostFieldName(name)) {
+      throw new TypeError(
+        `Unsupported host ledger field ${JSON.stringify(name)}: the ledger does not persist card data, raw payloads, line items, or amounts.`,
+      );
+    }
     if (CORE_FIELD_NAMES.has(name) || !HOST_FIELD_NAME.test(name)) {
       throw new TypeError(
         `Unsupported host ledger field ${JSON.stringify(name)}: expected a non-core name matching [A-Za-z][A-Za-z0-9_]{0,63}.`,
@@ -388,7 +438,7 @@ function storedHostValue(value: unknown): StoredValue {
 }
 
 function isWrittenHostValue(value: HostFieldValue | undefined): boolean {
-  return value !== undefined && value !== null && value !== "";
+  return value !== undefined && value !== null;
 }
 
 function assertTtlMs(ttlMs: number): number {
@@ -510,6 +560,7 @@ function blankLedgerRecord<TFields extends LedgerFieldMap>(
     snapshotAt: null,
     reservationId: null,
     reservationExpiresAt: null,
+    reservationSeeded: false,
     offerRedeemed: false,
     ...blankHostFields(invariants),
   };
@@ -520,6 +571,19 @@ function blankLedgerRecord<TFields extends LedgerFieldMap>(
  * The first provider event must still apply; a corrupt row that already
  * carries subscription state without a watermark must not.
  */
+export function hasReservationProvenance(
+  record: Pick<
+    LedgerFields,
+    "reservationId" | "reservationExpiresAt" | "reservationSeeded"
+  >,
+): boolean {
+  return (
+    record.reservationSeeded === true ||
+    record.reservationId != null ||
+    record.reservationExpiresAt != null
+  );
+}
+
 export function isEventlessLedgerRow(
   record: Pick<
     LedgerFields,
@@ -536,9 +600,13 @@ export function isEventlessLedgerRow(
     | "trialStartAt"
     | "trialEndAt"
     | "cancelAtPeriodEnd"
+    | "reservationId"
+    | "reservationExpiresAt"
+    | "reservationSeeded"
   >,
 ): boolean {
   return (
+    hasReservationProvenance(record) &&
     record.eventAt === null &&
     record.eventId === null &&
     record.snapshotAt === null &&
@@ -635,8 +703,6 @@ function projectAppliedRecord<THost extends HostFields>(
   invariants: LedgerInvariants<THost> | undefined,
 ): LedgerRecord<THost> {
   const granting = isGrantingStatus(event.status);
-  const offerRedeemed =
-    current?.offerRedeemed === true || granting || event.offerRedeemed === true;
   return {
     accountId,
     providerCustomerId: event.providerCustomerId,
@@ -656,7 +722,8 @@ function projectAppliedRecord<THost extends HostFields>(
     reservationExpiresAt: granting
       ? null
       : (current?.reservationExpiresAt ?? null),
-    offerRedeemed,
+    reservationSeeded: current?.reservationSeeded === true,
+    offerRedeemed: offerIsRedeemed(current, event),
     ...applyLedgerInvariants(current, event.fields, invariants),
   } as LedgerRecord<THost>;
 }
@@ -748,7 +815,7 @@ export function decideReservation<THost extends HostFields = {}>(
     current === null
       ? (blankLedgerRecord(accountId, invariants) as LedgerRecord<THost>)
       : current;
-  if (base.offerRedeemed) {
+  if (base.offerRedeemed || isTerminalStatus(base.status)) {
     return { action: "keep", reason: "redeemed" };
   }
   if (isGrantingStatus(base.status)) {
@@ -764,6 +831,7 @@ export function decideReservation<THost extends HostFields = {}>(
       accountId,
       reservationId,
       reservationExpiresAt: expiresAt,
+      reservationSeeded: true,
     },
   };
 }
@@ -773,11 +841,10 @@ type EncodedLedgerRecord<THost extends HostFields> = Record<
   StoredValue
 >;
 
-function encodeLedgerRecord<THost extends HostFields>(
-  value: LedgerRecord<THost>,
-  hostKeys: readonly (keyof THost & string)[],
-): EncodedLedgerRecord<THost> {
-  const encoded = {
+function encodeLedgerCore(
+  value: LedgerFields,
+): Record<keyof LedgerFields, StoredValue> {
+  return {
     accountId: value.accountId,
     providerCustomerId: value.providerCustomerId,
     providerSubscriptionId: value.providerSubscriptionId,
@@ -794,9 +861,20 @@ function encodeLedgerRecord<THost extends HostFields>(
     snapshotAt: value.snapshotAt,
     reservationId: value.reservationId,
     reservationExpiresAt: value.reservationExpiresAt,
+    reservationSeeded: value.reservationSeeded,
     offerRedeemed: value.offerRedeemed,
-  } as EncodedLedgerRecord<THost>;
+  } satisfies Record<keyof LedgerFields, StoredValue>;
+}
+
+function encodeLedgerRecord<THost extends HostFields>(
+  value: LedgerRecord<THost>,
+  hostKeys: readonly (keyof THost & string)[],
+): EncodedLedgerRecord<THost> {
+  const encoded = encodeLedgerCore(value) as EncodedLedgerRecord<THost>;
   for (const key of hostKeys) {
+    if (isForbiddenHostFieldName(key)) {
+      continue;
+    }
     encoded[key] = storedHostValue((value as Record<string, unknown>)[key]);
   }
   return encoded;
@@ -831,6 +909,7 @@ function decodeLedgerRecord<THost extends HostFields>(
     snapshotAt: storedTimestamp(record["snapshotAt"]),
     reservationId: toNullableString(record["reservationId"]),
     reservationExpiresAt: storedTimestamp(record["reservationExpiresAt"]),
+    reservationSeeded: record["reservationSeeded"] === true,
     offerRedeemed: record["offerRedeemed"] === true,
     ...host,
   } as LedgerRecord<THost>;
