@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stage:** Phase 3 — snapshot reconciliation in-tree. Nothing is
+**Stage:** Phase 4 — Stripe adapter in-tree. Nothing is
 published. (`0.1.0`, unpublished.)
 
 **Extraction source:** the RetireGolden account API's subscription ledger —
@@ -176,10 +176,15 @@ reservation with its read-winner-back semantics and TTL expiry.
 The sweep, the domain CAS token, the always-write freshness rule — with
 the delayed-intermediate-webhook scenario pinned as a named test.
 
-### Phase 4 — the Stripe adapter
+### Phase 4 — the Stripe adapter (this tree)
 
-Translation from Stripe events and subscription snapshots, against the
-reference application's real event corpus.
+Translation from Stripe events and subscription snapshots into
+`LedgerEvent` / snapshot fetches. The core stays provider-agnostic.
+Signature verification stays with the host; the vendor client stays
+behind the adapter. Named consumers are RetireGolden.org (Stripe
+subscriptions) and Exsimplify (Stripe Checkout today; the adapter still
+translates subscription and event shapes). Their private internals stay
+out of this tree.
 
 ### Phase 5 — first consumer
 
@@ -191,10 +196,9 @@ acceptance bar.
 
 ## Timing
 
-Phase 3 is implemented in-tree. Later phases remain gated: the Stripe
-adapter (Phase 4) waits until a named consumer needs it. Phase 5 (first
-consumer cutover) stays gated on that application's operational calendar
-— never swap code under a soak or mid-migration.
+Phase 4 is implemented in-tree. Phase 5 (first consumer cutover) stays
+gated on that application's operational calendar — never swap code under
+a soak or mid-migration.
 
 ## Open questions
 

@@ -1,16 +1,17 @@
 # Release operations
 
-`@pegma/billing-core` publishes only from a stable GitHub release. Merging a
-pull request never publishes, and the workflow has no manual-dispatch or
-npm-token fallback.
+`@pegma/billing-core` and `@pegma/billing-stripe` publish only from a
+stable GitHub release. Merging a pull request never publishes, and the
+workflow has no manual-dispatch or npm-token fallback.
 
 ## Required external configuration
 
 Before the first release through this workflow:
 
-- configure `@pegma/billing-core` on npm with the GitHub Actions trusted
-  publisher `pegma-dev/billing-core`, workflow `publish.yml`, environment
-  `npm-publish`, and allowed action `npm publish`;
+- configure `@pegma/billing-core` and `@pegma/billing-stripe` on npm with
+  the GitHub Actions trusted publisher `pegma-dev/billing-core`, workflow
+  `publish.yml`, environment `npm-publish`, and allowed action
+  `npm publish`;
 - create the GitHub `npm-publish` environment. A second reviewer is not
   required under Pegma's single-maintainer policy;
 - create the repository Actions variable `RELEASE_ALLOWED_SIGNERS` containing
@@ -25,7 +26,8 @@ remaining traditional npm publish tokens.
 
 ## Release procedure
 
-The version in `packages/billing-core/package.json` is the release version.
+The versions in `packages/billing-core/package.json` and
+`packages/billing-stripe/package.json` are the release versions.
 Change it through an ordinary reviewed pull request and run the complete gate
 on Node 22 and 24.
 

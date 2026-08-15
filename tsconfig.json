@@ -1,4 +1,7 @@
 {
   "files": [],
-  "references": [{ "path": "./packages/billing-core" }]
+  "references": [
+    { "path": "./packages/billing-core" },
+    { "path": "./packages/billing-stripe" }
+  ]
 }

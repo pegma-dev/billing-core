@@ -36,6 +36,7 @@ describe("release package metadata", () => {
   it("keeps the exact public package inventory", () => {
     expect(RELEASE_PACKAGES.map(({ name }) => name)).toEqual([
       "@pegma/billing-core",
+      "@pegma/billing-stripe",
     ]);
   });
 
@@ -55,9 +56,12 @@ describe("release package metadata", () => {
 
     expect(manifests.map(({ name, version }) => ({ name, version }))).toEqual([
       { name: "@pegma/billing-core", version: "0.1.0" },
+      { name: "@pegma/billing-stripe", version: "0.1.0" },
     ]);
     expect(manifests[0]?.dependencies?.["@pegma/spine"]).toBe("0.1.2");
     expect(manifests[0]?.dependencies?.["@pegma/storage-core"]).toBe("0.4.0");
+    expect(manifests[1]?.dependencies?.["@pegma/billing-core"]).toBe("0.1.0");
+    expect(manifests[1]?.dependencies?.["@pegma/spine"]).toBe("0.1.2");
     expect(packageVersion).toBe("0.1.0");
   });
 
@@ -125,6 +129,19 @@ packages:
       lockDependencyMatches(
         live["packages/billing-core"]?.dependencies?.["@pegma/storage-core"],
         "0.4.0",
+      ),
+    ).toBe(true);
+    expect(
+      lockDependencyMatches(
+        live["packages/billing-stripe"]?.dependencies?.["@pegma/billing-core"],
+        "0.1.0",
+        { workspace: true },
+      ),
+    ).toBe(true);
+    expect(
+      lockDependencyMatches(
+        live["packages/billing-stripe"]?.dependencies?.["@pegma/spine"],
+        "0.1.2",
       ),
     ).toBe(true);
   });

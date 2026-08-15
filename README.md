@@ -8,8 +8,9 @@ hosts: the durable record of what a customer's subscription **is**,
 maintained correctly under out-of-order webhook delivery.
 
 > [!IMPORTANT]
-> Pegma is in early `0.x` development. `@pegma/billing-core` Phase 3 is
-> in-tree and unpublished. No public API is stable.
+> Pegma is in early `0.x` development. `@pegma/billing-core` and
+> `@pegma/billing-stripe` Phase 4 are in-tree and unpublished. No public
+> API is stable.
 
 ## The part everyone gets wrong
 
@@ -29,13 +30,13 @@ makes that impossible:
 - periodic **snapshot reconciliation** that repairs field drift without
   disturbing the dedup identity of the events themselves.
 
-Phase 3 ships the watermark, the effective-watermark guard,
+Phase 4 ships the watermark, the effective-watermark guard,
 lifecycle-rank arbitration, declared ledger invariants (`sticky`,
-`firstWins`), the checkout reservation, and snapshot reconciliation.
-The Stripe adapter is a later phase. The core knows lifecycle states, not
-Stripe's vocabulary. And the data boundary is absolute: the ledger stores
-provider identifiers and derived state — never a card number, a raw
-payload, or an amount.
+`firstWins`), the checkout reservation, snapshot reconciliation, and
+Stripe event/snapshot translation. The core knows lifecycle states, not
+Stripe's vocabulary — `@pegma/billing-stripe` is the translation. And
+the data boundary is absolute: the ledger stores provider identifiers
+and derived state — never a card number, a raw payload, or an amount.
 
 Not here, on purpose: payment processing and checkout flows, entitlement
 resolution ([Authorization Core](https://github.com/pegma-dev/authorization-core)'s
@@ -56,10 +57,8 @@ application.
 
 | Package                 | Role                                                    | Phase |
 | ----------------------- | ------------------------------------------------------- | ----- |
-| `@pegma/billing-core`   | Ledger, watermark, rank, invariants, reservation, sweep | 3     |
-| `@pegma/billing-stripe` | Event and snapshot translation                          | later |
-
-The Stripe adapter package is not created until Phase 4.
+| `@pegma/billing-core`   | Ledger, watermark, rank, invariants, reservation, sweep | 4     |
+| `@pegma/billing-stripe` | Event and snapshot translation                          | 4     |
 
 ## Constraint that shapes everything
 

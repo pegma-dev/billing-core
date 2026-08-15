@@ -4,7 +4,7 @@
 
 This project is in early `0.x` development and is not published yet.
 Security fixes apply to the latest reviewed source until the first
-advertised release of `@pegma/billing-core`.
+advertised release of `@pegma/billing-core` and `@pegma/billing-stripe`.
 
 ## Reporting a vulnerability
 

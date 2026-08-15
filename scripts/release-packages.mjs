@@ -29,6 +29,10 @@ export const RELEASE_PACKAGES = [
     directory: "billing-core",
     name: "@pegma/billing-core",
   },
+  {
+    directory: "billing-stripe",
+    name: "@pegma/billing-stripe",
+  },
 ];
 
 const RELEASE_NAMES = new Set(RELEASE_PACKAGES.map(({ name }) => name));
