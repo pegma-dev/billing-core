@@ -1,6 +1,6 @@
 {
   "name": "@pegma/billing-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Provider-agnostic subscription ledger: event watermark, lifecycle-rank arbitration, declared invariants, checkout reservation, and snapshot reconciliation.",
   "license": "MIT",
   "type": "module",
@@ -35,6 +35,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "prepack": "pnpm run build"
+    "prepack": "tsc -p tsconfig.json"
   }
 }

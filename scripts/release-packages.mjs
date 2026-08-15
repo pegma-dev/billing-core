@@ -101,11 +101,21 @@ function runNpm(arguments_, options = {}) {
   });
 }
 
-function runPnpm(arguments_, options = {}) {
-  return run(process.platform === "win32" ? "pnpm.cmd" : "pnpm", arguments_, {
-    ...options,
-    shell: process.platform === "win32",
-  });
+/**
+ * `npm --json` writes a JSON value. Lifecycle scripts invoked during
+ * `npm pack` (including a package `prepack` of `pnpm run build`) may
+ * print a human banner on the same stdout:
+ *   > @pegma/...@0.1.1 build /home/runner/work/...
+ * Parse from the first JSON token so that banner is never fed to
+ * JSON.parse.
+ */
+export function parseNpmJsonStdout(stdout) {
+  const text = typeof stdout === "string" ? stdout : "";
+  const start = text.search(/[\[{]/u);
+  if (start === -1) {
+    fail("npm did not write JSON output");
+  }
+  return JSON.parse(text.slice(start));
 }
 
 function unquoteYamlScalar(value) {
@@ -389,7 +399,10 @@ async function validatePackage(root, definition, lockfile) {
   }
   if (
     typeof manifest.scripts?.prepack !== "string" ||
-    !manifest.scripts.prepack.includes("build")
+    !(
+      manifest.scripts.prepack.includes("build") ||
+      manifest.scripts.prepack.includes("tsc")
+    )
   ) {
     fail(`${definition.name} must build during prepack`);
   }
@@ -671,7 +684,7 @@ function queryRegistryIntegrity(name, version) {
     allowFailure: true,
   });
   if (result.status === 0) {
-    const integrity = JSON.parse(result.stdout);
+    const integrity = parseNpmJsonStdout(result.stdout);
     if (typeof integrity !== "string" || integrity.length === 0) {
       fail(`${spec} exists without dist.integrity`);
     }
@@ -716,7 +729,7 @@ export async function prepareRelease(options = {}) {
     fail(`release output directory must be empty: ${output}`);
   }
 
-  runPnpm(["run", "build"], { cwd: root });
+  runNpm(["run", "build"], { cwd: root });
   const records = [];
   const tagVersion = releaseTag?.slice(1);
   for (const { definition, manifest } of packages) {
@@ -730,7 +743,7 @@ export async function prepareRelease(options = {}) {
       ],
       { cwd: root, capture: true },
     );
-    const [packed] = JSON.parse(result.stdout);
+    const [packed] = parseNpmJsonStdout(result.stdout);
     if (
       packed?.name !== definition.name ||
       packed?.version !== manifest.version ||
