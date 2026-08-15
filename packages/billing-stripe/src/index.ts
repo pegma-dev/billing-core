@@ -185,7 +185,21 @@ function subscriptionRecord(value: unknown): Record<string, unknown> | null {
   if (value["object"] === "subscription") {
     return value;
   }
-  if (typeof value["status"] === "string" && idFrom(value) !== null) {
+  // A present discriminator that is not "subscription" is never a
+  // Subscription — PaymentIntent, Checkout Session, Invoice, and similar
+  // all carry their own id + status.
+  if (value["object"] !== undefined) {
+    return null;
+  }
+  // Structural fallback only when Stripe omitted the discriminator, and
+  // only for a subscription-shaped id. A bare `pi_…` / `cs_…` / `in_…`
+  // with a lifecycle-like status must not become providerSubscriptionId.
+  const id = idFrom(value);
+  if (
+    id !== null &&
+    id.startsWith("sub_") &&
+    typeof value["status"] === "string"
+  ) {
     return value;
   }
   return null;
@@ -194,10 +208,12 @@ function subscriptionRecord(value: unknown): Record<string, unknown> | null {
 /**
  * Pulls an expanded Subscription out of a verified Stripe object.
  *
- * Accepts a Subscription, a Checkout Session whose `subscription` is
- * expanded, or an Invoice whose `subscription` (or
- * `parent.subscription_details.subscription`) is expanded. A bare id is
- * not enough to write derived state — the host should snapshot-fetch.
+ * Accepts a Subscription (`object === "subscription"`), a Checkout
+ * Session whose `subscription` is expanded, or an Invoice whose
+ * `subscription` (or `parent.subscription_details.subscription`) is
+ * expanded. Wrappers are never themselves a Subscription, even when they
+ * have an id and a status. A bare id is not enough to write derived
+ * state — the host should snapshot-fetch.
  */
 export function stripeSubscriptionFromObject(
   value: unknown,

@@ -221,7 +221,9 @@ describe("translateStripeSubscription", () => {
     const subscription = stripeSubscription({ status: "trialing" });
     expect(
       translateStripeSubscription({
+        id: "cs_123",
         object: "checkout.session",
+        status: "complete",
         mode: "subscription",
         subscription,
         amount_total: 9900,
@@ -229,21 +231,60 @@ describe("translateStripeSubscription", () => {
     ).toMatchObject({ status: "trialing", providerSubscriptionId: "sub_123" });
     expect(
       translateStripeSubscription({
+        id: "in_123",
         object: "invoice",
+        status: "paid",
         subscription,
         amount_paid: 9900,
       }),
-    ).toMatchObject({ status: "trialing" });
+    ).toMatchObject({ status: "trialing", providerSubscriptionId: "sub_123" });
     expect(
       translateStripeSubscription({
+        id: "in_parent",
         object: "invoice",
+        status: "open",
         parent: { subscription_details: { subscription } },
       }),
-    ).toMatchObject({ status: "trialing" });
+    ).toMatchObject({ status: "trialing", providerSubscriptionId: "sub_123" });
     expect(
       stripeSubscriptionFromObject({
+        id: "cs_bare",
         object: "checkout.session",
+        status: "complete",
         subscription: "sub_123",
+      }),
+    ).toBeNull();
+  });
+
+  it("does not treat a PaymentIntent or other id+status object as a Subscription", () => {
+    expect(
+      stripeSubscriptionFromObject({
+        id: "pi_123",
+        object: "payment_intent",
+        status: "canceled",
+        customer: "cus_123",
+      }),
+    ).toBeNull();
+    expect(
+      translateStripeSubscription({
+        id: "pi_123",
+        object: "payment_intent",
+        status: "canceled",
+        customer: "cus_123",
+      }),
+    ).toBeNull();
+    expect(
+      stripeSubscriptionFromObject({
+        id: "cs_123",
+        object: "checkout.session",
+        status: "complete",
+      }),
+    ).toBeNull();
+    expect(
+      stripeSubscriptionFromObject({
+        id: "in_123",
+        object: "invoice",
+        status: "paid",
       }),
     ).toBeNull();
   });
@@ -289,7 +330,9 @@ describe("translateStripeEvent", () => {
   it("translates checkout.session.completed when the subscription is expanded", () => {
     const event = translateStripeEvent(
       stripeEvent("checkout.session.completed", {
+        id: "cs_123",
         object: "checkout.session",
+        status: "complete",
         mode: "subscription",
         customer: "cus_123",
         subscription: stripeSubscription({ status: "active" }),
@@ -302,7 +345,58 @@ describe("translateStripeEvent", () => {
       status: "active",
       providerSubscriptionId: "sub_123",
     });
+    expect(event?.providerSubscriptionId).not.toBe("cs_123");
     assertNoForbiddenFields(event!);
+  });
+
+  it("translates invoice.paid when the subscription is expanded", () => {
+    const event = translateStripeEvent(
+      stripeEvent("invoice.paid", {
+        id: "in_123",
+        object: "invoice",
+        status: "paid",
+        customer: "cus_123",
+        subscription: stripeSubscription({ status: "active" }),
+        amount_paid: 9900,
+      }),
+    );
+    expect(event).toMatchObject({
+      eventId: "evt_123",
+      eventAt: SECOND_ISO,
+      status: "active",
+      providerSubscriptionId: "sub_123",
+    });
+    expect(event?.providerSubscriptionId).not.toBe("in_123");
+  });
+
+  it("does not write a PaymentIntent id as providerSubscriptionId", () => {
+    const event = translateStripeEvent(
+      stripeEvent("payment_intent.canceled", {
+        id: "pi_123",
+        object: "payment_intent",
+        status: "canceled",
+        customer: "cus_123",
+        amount: 9900,
+      }),
+    );
+    expect(event).toBeNull();
+    expect(
+      translateStripeEvent(
+        stripeEvent("payment_intent.canceled", {
+          id: "pi_stripped",
+          status: "canceled",
+          customer: "cus_123",
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("still accepts a discriminator-less subscription-shaped retrieve", () => {
+    const { object: _object, ...stripped } = stripeSubscription();
+    expect(translateStripeSubscription(stripped)).toMatchObject({
+      providerSubscriptionId: "sub_123",
+      status: "active",
+    });
   });
 
   it("ignores events that do not carry an expanded subscription", () => {
