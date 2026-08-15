@@ -99,11 +99,11 @@ protected signed annotated `vX.Y.Z` tag already on `origin/main`, followed by
 
 ## Where things stand
 
-Phase 2: `@pegma/billing-core` (ledger collection, `(eventAt, eventId)`
+Phase 3: `@pegma/billing-core` (ledger collection, `(eventAt, eventId)`
 watermark, effective-watermark guard, lifecycle-rank tie-break, declared
-`sticky` / `firstWins` combinators, checkout reservation). Nothing is
-published. Snapshot reconciliation is Phase 3; `@pegma/billing-stripe` is
-Phase 4 — do not create those packages here yet.
+`sticky` / `firstWins` combinators, checkout reservation, snapshot
+reconciliation). Nothing is published. `@pegma/billing-stripe` is Phase 4
+— do not create that package here yet.
 
 Siblings: [spine](https://github.com/pegma-dev/spine),
 [storage-core](https://github.com/pegma-dev/storage-core),

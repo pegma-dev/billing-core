@@ -8,7 +8,7 @@ hosts: the durable record of what a customer's subscription **is**,
 maintained correctly under out-of-order webhook delivery.
 
 > [!IMPORTANT]
-> Pegma is in early `0.x` development. `@pegma/billing-core` Phase 2 is
+> Pegma is in early `0.x` development. `@pegma/billing-core` Phase 3 is
 > in-tree and unpublished. No public API is stable.
 
 ## The part everyone gets wrong
@@ -29,10 +29,10 @@ makes that impossible:
 - periodic **snapshot reconciliation** that repairs field drift without
   disturbing the dedup identity of the events themselves.
 
-Phase 2 ships the watermark, the effective-watermark guard,
+Phase 3 ships the watermark, the effective-watermark guard,
 lifecycle-rank arbitration, declared ledger invariants (`sticky`,
-`firstWins`), and the checkout reservation. Snapshot reconciliation and
-the Stripe adapter are later phases. The core knows lifecycle states, not
+`firstWins`), the checkout reservation, and snapshot reconciliation.
+The Stripe adapter is a later phase. The core knows lifecycle states, not
 Stripe's vocabulary. And the data boundary is absolute: the ledger stores
 provider identifiers and derived state — never a card number, a raw
 payload, or an amount.
@@ -54,10 +54,10 @@ application.
 
 ## Packages
 
-| Package                 | Role                                             | Phase |
-| ----------------------- | ------------------------------------------------ | ----- |
-| `@pegma/billing-core`   | Ledger, watermark, rank, invariants, reservation | 2     |
-| `@pegma/billing-stripe` | Event and snapshot translation                   | later |
+| Package                 | Role                                                    | Phase |
+| ----------------------- | ------------------------------------------------------- | ----- |
+| `@pegma/billing-core`   | Ledger, watermark, rank, invariants, reservation, sweep | 3     |
+| `@pegma/billing-stripe` | Event and snapshot translation                          | later |
 
 The Stripe adapter package is not created until Phase 4.
 

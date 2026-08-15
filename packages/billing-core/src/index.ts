@@ -6,6 +6,7 @@ import {
 } from "@pegma/spine";
 import {
   defineCollection,
+  MAX_SCAN_PAGE_SIZE,
   type CollectionDefinition,
   type EntityKey,
   type Store,
@@ -22,6 +23,9 @@ const LEDGER_ROW_ID = "subscription";
 /** Default checkout-reservation lifetime. Abandoned checkouts expire. */
 export const DEFAULT_RESERVATION_TTL_MS = 30 * 60 * 1000;
 const MAX_RESERVATION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Default page size for a snapshot-reconciliation sweep. */
+export const DEFAULT_SWEEP_LIMIT = 100;
 
 /**
  * Provider-agnostic subscription lifecycle.
@@ -160,6 +164,38 @@ export type LedgerEvent<THost extends HostFields = {}> = {
   readonly fields?: Partial<THost>;
 };
 
+/**
+ * Domain CAS token for snapshot reconciliation: the `(eventAt, eventId)`
+ * pair observed before the provider fetch. Not a storage version.
+ */
+export interface WatermarkToken {
+  readonly eventAt: IsoTimestamp | null;
+  readonly eventId: string | null;
+}
+
+/**
+ * Provider truth used to repair field drift. It does not carry a watermark;
+ * applying it must not change `eventAt` or `eventId`.
+ */
+export type LedgerSnapshot<THost extends HostFields = {}> = {
+  readonly status: LifecycleStatus;
+  readonly providerCustomerId: string | null;
+  readonly providerSubscriptionId: string | null;
+  readonly providerPriceId: string | null;
+  readonly plan: string | null;
+  readonly periodStartAt: IsoTimestamp | null;
+  readonly periodEndAt: IsoTimestamp | null;
+  readonly trialStartAt: IsoTimestamp | null;
+  readonly trialEndAt: IsoTimestamp | null;
+  readonly cancelAtPeriodEnd: boolean;
+  readonly offerRedeemed?: boolean;
+  readonly fields?: Partial<THost>;
+};
+
+export type FetchLedgerSnapshot<THost extends HostFields = {}> = (
+  observed: LedgerRecord<THost>,
+) => Promise<LedgerSnapshot<THost> | null>;
+
 export type IgnoreReason = "redelivery" | "stale" | "equal-rank";
 
 export type ApplicationDecision<THost extends HostFields = {}> =
@@ -193,6 +229,31 @@ export interface ReleaseResult {
   readonly released: boolean;
 }
 
+export type SnapshotIgnoreReason =
+  "missing" | "unavailable" | "intervening-write";
+
+export type SnapshotDecision<THost extends HostFields = {}> =
+  | { readonly action: "write"; readonly value: LedgerRecord<THost> }
+  | { readonly action: "keep"; readonly reason: SnapshotIgnoreReason };
+
+export type ReconcileResult<THost extends HostFields = {}> =
+  | { readonly written: true; readonly record: LedgerRecord<THost> }
+  | {
+      readonly written: false;
+      readonly record: LedgerRecord<THost> | null;
+      readonly reason: SnapshotIgnoreReason;
+    };
+
+export interface SweepOptions {
+  readonly limit?: number;
+  readonly cursor?: string;
+}
+
+export interface SweepResult<THost extends HostFields = {}> {
+  readonly results: readonly ReconcileResult<THost>[];
+  readonly nextCursor: string | null;
+}
+
 export interface BillingLedger<THost extends HostFields = {}> {
   get(accountId: string): Promise<LedgerRecord<THost> | null>;
   apply(
@@ -201,6 +262,14 @@ export interface BillingLedger<THost extends HostFields = {}> {
   ): Promise<ApplyResult<THost>>;
   reserve(accountId: string, options?: ReserveOptions): Promise<ReserveResult>;
   release(accountId: string, reservationId: string): Promise<ReleaseResult>;
+  reconcile(
+    accountId: string,
+    fetchSnapshot: FetchLedgerSnapshot<THost>,
+  ): Promise<ReconcileResult<THost>>;
+  sweep(
+    fetchSnapshot: FetchLedgerSnapshot<THost>,
+    options?: SweepOptions,
+  ): Promise<SweepResult<THost>>;
 }
 
 export interface BillingLedgerOptions<TFields extends LedgerFieldMap = {}> {
@@ -474,11 +543,59 @@ function defaultNewId(): string {
   return cryptoApi.randomUUID();
 }
 
-function requireClock(clock: Clock | undefined): Clock {
+function requireClock(clock: Clock | undefined, purpose: string): Clock {
   if (clock === undefined) {
-    throw new TypeError("Billing reservation requires an injected Clock.");
+    throw new TypeError(`${purpose} requires an injected Clock.`);
   }
   return clock;
+}
+
+function assertSweepLimit(limit: number): number {
+  if (
+    typeof limit !== "number" ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > MAX_SCAN_PAGE_SIZE
+  ) {
+    throw new TypeError(
+      `Unsupported sweep page size: expected an integer from 1 through ${MAX_SCAN_PAGE_SIZE}.`,
+    );
+  }
+  return limit;
+}
+
+function laterTimestamp(
+  left: IsoTimestamp | null,
+  right: IsoTimestamp,
+): IsoTimestamp {
+  if (left === null) {
+    return right;
+  }
+  const leftMs = canonicalTimestampMilliseconds(left);
+  const rightMs = canonicalTimestampMilliseconds(right);
+  if (leftMs === null) {
+    return right;
+  }
+  if (rightMs === null) {
+    return left;
+  }
+  return leftMs >= rightMs ? left : right;
+}
+
+/** Reads the domain CAS token from a ledger row. */
+export function observeWatermark(
+  record: Pick<LedgerFields, "eventAt" | "eventId">,
+): WatermarkToken {
+  return { eventAt: record.eventAt, eventId: record.eventId };
+}
+
+export function watermarksMatch(
+  current: Pick<LedgerFields, "eventAt" | "eventId">,
+  observed: WatermarkToken,
+): boolean {
+  return (
+    current.eventAt === observed.eventAt && current.eventId === observed.eventId
+  );
 }
 
 function assertEvent<THost extends HostFields>(
@@ -510,6 +627,35 @@ function assertEvent<THost extends HostFields>(
     trialEndAt: optionalTimestamp(event.trialEndAt, "trial end"),
     cancelAtPeriodEnd: event.cancelAtPeriodEnd === true,
     ...(event.offerRedeemed === true ? { offerRedeemed: true } : {}),
+    ...(fields === undefined ? {} : { fields }),
+  };
+}
+
+function assertSnapshot<THost extends HostFields>(
+  snapshot: LedgerSnapshot<THost>,
+): LedgerSnapshot<THost> {
+  const fields = snapshot.fields;
+  return {
+    status: assertLifecycleStatus(snapshot.status),
+    providerCustomerId: assertNullableString(
+      snapshot.providerCustomerId,
+      "provider customer id",
+    ),
+    providerSubscriptionId: assertNullableString(
+      snapshot.providerSubscriptionId,
+      "provider subscription id",
+    ),
+    providerPriceId: assertNullableString(
+      snapshot.providerPriceId,
+      "provider price id",
+    ),
+    plan: assertNullableString(snapshot.plan, "plan"),
+    periodStartAt: optionalTimestamp(snapshot.periodStartAt, "period start"),
+    periodEndAt: optionalTimestamp(snapshot.periodEndAt, "period end"),
+    trialStartAt: optionalTimestamp(snapshot.trialStartAt, "trial start"),
+    trialEndAt: optionalTimestamp(snapshot.trialEndAt, "trial end"),
+    cancelAtPeriodEnd: snapshot.cancelAtPeriodEnd === true,
+    ...(snapshot.offerRedeemed === true ? { offerRedeemed: true } : {}),
     ...(fields === undefined ? {} : { fields }),
   };
 }
@@ -829,6 +975,70 @@ export function decideReservation<THost extends HostFields = {}>(
   };
 }
 
+function projectSnapshotRecord<THost extends HostFields>(
+  current: LedgerRecord<THost>,
+  snapshot: LedgerSnapshot<THost>,
+  snapshotAt: IsoTimestamp,
+  invariants: LedgerInvariants<THost> | undefined,
+): LedgerRecord<THost> {
+  const granting = isGrantingStatus(snapshot.status);
+  return {
+    accountId: current.accountId,
+    providerCustomerId: snapshot.providerCustomerId,
+    providerSubscriptionId: snapshot.providerSubscriptionId,
+    providerPriceId: snapshot.providerPriceId,
+    status: snapshot.status,
+    plan: snapshot.plan,
+    periodStartAt: snapshot.periodStartAt,
+    periodEndAt: snapshot.periodEndAt,
+    trialStartAt: snapshot.trialStartAt,
+    trialEndAt: snapshot.trialEndAt,
+    cancelAtPeriodEnd: snapshot.cancelAtPeriodEnd,
+    eventAt: current.eventAt,
+    eventId: current.eventId,
+    snapshotAt: laterTimestamp(current.snapshotAt, snapshotAt),
+    reservationId: granting ? null : (current.reservationId ?? null),
+    reservationExpiresAt: granting
+      ? null
+      : (current.reservationExpiresAt ?? null),
+    reservationSeeded: current.reservationSeeded === true,
+    offerRedeemed: offerIsRedeemed(current, snapshot),
+    ...applyLedgerInvariants(current, snapshot.fields, invariants),
+  } as LedgerRecord<THost>;
+}
+
+/**
+ * Decides whether a provider snapshot may repair the current ledger row.
+ *
+ * The host must observe {@link WatermarkToken} first, then fetch provider
+ * truth, then call this against freshly read state. A token mismatch means
+ * an intervening write landed; drop the snapshot. A match ALWAYS writes —
+ * even when no field changed — so `snapshotAt` advances and a delayed
+ * intermediate webhook cannot land after a no-op sweep. `eventAt` and
+ * `eventId` are copied from current state and never replaced.
+ *
+ * Host-declared `sticky` / `firstWins` fields are enforced on the write
+ * against the freshly read row.
+ */
+export function decideLedgerSnapshot<THost extends HostFields = {}>(
+  current: LedgerRecord<THost> | null,
+  observed: WatermarkToken,
+  snapshot: LedgerSnapshot<THost>,
+  snapshotAt: IsoTimestamp,
+  invariants?: LedgerInvariants<THost>,
+): SnapshotDecision<THost> {
+  if (current === null) {
+    return { action: "keep", reason: "missing" };
+  }
+  if (!watermarksMatch(current, observed)) {
+    return { action: "keep", reason: "intervening-write" };
+  }
+  return {
+    action: "write",
+    value: projectSnapshotRecord(current, snapshot, snapshotAt, invariants),
+  };
+}
+
 type EncodedLedgerRecord<THost extends HostFields> = Record<
   keyof LedgerFields | keyof THost,
   StoredValue
@@ -948,6 +1158,65 @@ export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
   const definition = billingLedgerCollection(options.fields);
   const rows = options.store.collection(definition);
 
+  async function reconcileAccount(
+    accountId: string,
+    fetchSnapshot: FetchLedgerSnapshot<THost>,
+  ): Promise<ReconcileResult<THost>> {
+    assertSafeAccountId(accountId);
+    const clock = requireClock(
+      options.clock,
+      "Billing snapshot reconciliation",
+    );
+    const observed = await rows.get(billingLedgerKey(accountId));
+    if (observed === null) {
+      logger.log("info", "Billing ledger snapshot ignored", {
+        accountId,
+        written: false,
+      });
+      return { written: false, record: null, reason: "missing" };
+    }
+    const token = observeWatermark(observed);
+    const fetched = await fetchSnapshot(observed);
+    if (fetched === null) {
+      logger.log("info", "Billing ledger snapshot ignored", {
+        accountId,
+        eventId: token.eventId,
+        written: false,
+      });
+      return { written: false, record: observed, reason: "unavailable" };
+    }
+    const snapshot = assertSnapshot(fetched);
+    const snapshotAt = assertClockNow(clock);
+    const result = await rows.update(billingLedgerKey(accountId), (current) =>
+      decideLedgerSnapshot(current, token, snapshot, snapshotAt, invariants),
+    );
+    const written = result.written;
+    logger.log(
+      "info",
+      written
+        ? "Billing ledger snapshot written"
+        : "Billing ledger snapshot ignored",
+      {
+        accountId,
+        eventId: token.eventId,
+        written,
+      },
+    );
+    if (written) {
+      if (result.value === null) {
+        throw new Error(
+          "Billing ledger snapshot write did not persist a record.",
+        );
+      }
+      return { written: true, record: result.value };
+    }
+    return {
+      written: false,
+      record: result.value,
+      reason: result.value === null ? "missing" : "intervening-write",
+    };
+  }
+
   return {
     async get(accountId) {
       return rows.get(billingLedgerKey(accountId));
@@ -979,7 +1248,7 @@ export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
 
     async reserve(accountId, reserveOptions) {
       assertSafeAccountId(accountId);
-      const clock = requireClock(options.clock);
+      const clock = requireClock(options.clock, "Billing reservation");
       const ttlMs = assertTtlMs(reserveOptions?.ttlMs ?? defaultTtlMs);
       let refusal: ReserveRefusal | undefined;
       const result = await rows.update(
@@ -1057,6 +1326,30 @@ export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
         released,
       });
       return { released };
+    },
+
+    async reconcile(accountId, fetchSnapshot) {
+      return reconcileAccount(accountId, fetchSnapshot);
+    },
+
+    async sweep(fetchSnapshot, sweepOptions) {
+      requireClock(options.clock, "Billing snapshot reconciliation");
+      const limit = assertSweepLimit(
+        sweepOptions?.limit ?? DEFAULT_SWEEP_LIMIT,
+      );
+      const page = await rows.scan({
+        limit,
+        ...(sweepOptions?.cursor === undefined
+          ? {}
+          : { cursor: sweepOptions.cursor }),
+      });
+      const results: ReconcileResult<THost>[] = [];
+      for (const scanned of page.records) {
+        results.push(
+          await reconcileAccount(scanned.key.partition, fetchSnapshot),
+        );
+      }
+      return { results, nextCursor: page.nextCursor };
     },
   };
 }

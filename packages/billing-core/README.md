@@ -2,8 +2,8 @@
 
 Provider-agnostic subscription ledger for Pegma hosts: a per-account
 watermark, an effective-watermark guard, lifecycle-rank tie-breaking at
-the equal second, declared write-path invariants, and a single-opportunity
-checkout reservation.
+the equal second, declared write-path invariants, a single-opportunity
+checkout reservation, and snapshot reconciliation.
 
 > [!IMPORTANT]
 > Pegma is in early `0.x` development. This package's public API is unstable.
@@ -47,12 +47,26 @@ const reserved = await ledger.reserve("acct_456");
 if (reserved.reserved) {
   await ledger.release("acct_456", reserved.reservationId);
 }
+
+await ledger.reconcile("acct_123", async (observed) => ({
+  status: observed.status,
+  providerCustomerId: observed.providerCustomerId,
+  providerSubscriptionId: observed.providerSubscriptionId,
+  providerPriceId: observed.providerPriceId,
+  plan: observed.plan,
+  periodStartAt: observed.periodStartAt,
+  periodEndAt: observed.periodEndAt,
+  trialStartAt: observed.trialStartAt,
+  trialEndAt: observed.trialEndAt,
+  cancelAtPeriodEnd: observed.cancelAtPeriodEnd,
+}));
 ```
 
 Hosts inject a `@pegma/storage-core` `Store` and, optionally, a Spine
-`Clock` and `Logger`. Reservation TTL is taken from the injected clock —
-never from `Date.now()`. This package never creates a network client and
-never stores card data, raw payloads, line items, or amounts.
+`Clock` and `Logger`. Reservation TTL and snapshot freshness (`snapshotAt`)
+are taken from the injected clock — never from `Date.now()`. This package
+never creates a network client and never stores card data, raw payloads,
+line items, or amounts.
 
 Arrival order proves nothing. Every apply goes through the effective-watermark
 guard and lifecycle rank. Exact redelivery is an idempotent no-op.
@@ -62,6 +76,13 @@ enforced inside the update decider, so they re-evaluate against fresh state
 on every conflict. A reservation id is minted inside the decider and read
 back from storage; the caller's id is whatever the stored record says.
 
-Phase 2 is the arbitration core plus combinators and reservation. Snapshot
-reconciliation and the Stripe adapter are later phases — do not import them
+Snapshot reconciliation observes the domain CAS token `(eventAt, eventId)`,
+fetches provider truth afterward, and re-checks that token against fresh
+state. An intervening write drops the snapshot. A token match always writes
+— even when no field changed — so `snapshotAt` advances and a delayed
+intermediate webhook cannot land after a no-op sweep. The watermark identity
+is never touched.
+
+Phase 3 is the arbitration core, combinators, reservation, and snapshot
+reconciliation. The Stripe adapter is a later phase — do not import it
 from this package.
