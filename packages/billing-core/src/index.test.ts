@@ -329,6 +329,61 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       });
     });
 
+    it("does not apply onto an existing row whose watermark is missing", async () => {
+      const store = freshStore();
+      const rows = store.collection(billingLedgerCollection());
+      await rows.put(
+        record("acct_no_watermark", {
+          status: "canceled",
+          eventAt: null,
+          eventId: null,
+          snapshotAt: null,
+          plan: "kept",
+        }),
+      );
+      const ledger = createBillingLedger({ store });
+      const result = await ledger.apply(
+        "acct_no_watermark",
+        event("evt_granting_arrival", { status: "active", plan: "resurrect" }),
+      );
+      expect(result.applied).toBe(false);
+      expect(result.record).toMatchObject({
+        status: "canceled",
+        eventAt: null,
+        eventId: null,
+        snapshotAt: null,
+        plan: "kept",
+      });
+    });
+
+    it("orders expanded-year timestamps at true second resolution", async () => {
+      const store = freshStore();
+      const rows = store.collection(billingLedgerCollection());
+      await rows.put(
+        record("acct_expanded_year", {
+          eventAt: "+010000-01-01T00:00:00.000Z",
+          eventId: "evt_expanded_first",
+          status: "active",
+          plan: "first",
+        }),
+      );
+      const ledger = createBillingLedger({ store });
+      const result = await ledger.apply(
+        "acct_expanded_year",
+        event("evt_expanded_later", {
+          eventAt: "+010000-01-01T00:00:01.000Z",
+          status: "active",
+          plan: "second",
+        }),
+      );
+      expect(result.applied).toBe(true);
+      expect(result.record).toMatchObject({
+        eventId: "evt_expanded_later",
+        eventAt: "+010000-01-01T00:00:01.000Z",
+        plan: "second",
+      });
+    });
+
     it("drops a delayed event that is not strictly newer than max(eventAt, snapshotAt)", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
@@ -590,6 +645,10 @@ describe("lifecycle rank", () => {
   });
 });
 
+function unixSecond(timestamp: string): number {
+  return Math.floor(Date.parse(timestamp) / 1000);
+}
+
 describe("effective watermark and application decider", () => {
   it("uses max(eventAt, snapshotAt) at second resolution", () => {
     expect(
@@ -597,13 +656,62 @@ describe("effective watermark and application decider", () => {
         eventAt: EARLIER,
         snapshotAt: SNAPSHOT_BOUND,
       }),
-    ).toBe(SNAPSHOT_BOUND.slice(0, 19));
+    ).toBe(unixSecond(SNAPSHOT_BOUND));
     expect(
       effectiveWatermarkSecond({ eventAt: SECOND, snapshotAt: null }),
-    ).toBe(SECOND.slice(0, 19));
+    ).toBe(unixSecond(SECOND));
     expect(
       effectiveWatermarkSecond({ eventAt: null, snapshotAt: null }),
     ).toBeNull();
+  });
+
+  it("derives the second from the parsed instant so expanded years do not collide", () => {
+    const first = "+010000-01-01T00:00:00.000Z";
+    const laterSameMinute = "+010000-01-01T00:00:01.000Z";
+    expect(first.slice(0, 19)).toBe(laterSameMinute.slice(0, 19));
+    expect(effectiveWatermarkSecond({ eventAt: first, snapshotAt: null })).toBe(
+      unixSecond(first),
+    );
+    expect(
+      effectiveWatermarkSecond({
+        eventAt: laterSameMinute,
+        snapshotAt: null,
+      }),
+    ).toBe(unixSecond(laterSameMinute));
+    expect(
+      decideLedgerApplication(
+        record("acct", {
+          eventAt: first,
+          eventId: "evt_expanded_first",
+          status: "active",
+          plan: "first",
+        }),
+        "acct",
+        event("evt_expanded_later", {
+          eventAt: laterSameMinute,
+          status: "active",
+          plan: "second",
+        }),
+      ),
+    ).toMatchObject({
+      action: "write",
+      value: { eventId: "evt_expanded_later", plan: "second" },
+    });
+  });
+
+  it("keeps an existing row when the watermark is missing instead of applying by arrival", () => {
+    expect(
+      decideLedgerApplication(
+        record("acct", {
+          status: "canceled",
+          eventAt: null,
+          eventId: null,
+          snapshotAt: null,
+        }),
+        "acct",
+        event("evt_granting_arrival", { status: "active" }),
+      ),
+    ).toEqual({ action: "keep", reason: "stale" });
   });
 
   it("does not consult arrival order when two same-second events differ in rank", () => {

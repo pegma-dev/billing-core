@@ -167,32 +167,36 @@ function storedTimestamp(value: unknown): IsoTimestamp | null {
     : (value as IsoTimestamp);
 }
 
-function secondKey(timestamp: IsoTimestamp): string {
-  return timestamp.slice(0, 19);
+function timestampSeconds(timestamp: IsoTimestamp): number | null {
+  const milliseconds = canonicalTimestampMilliseconds(timestamp);
+  if (milliseconds === null) {
+    return null;
+  }
+  return Math.floor(milliseconds / 1000);
 }
 
 function maxSecond(
   left: IsoTimestamp | null,
   right: IsoTimestamp | null,
-): string | null {
-  if (left === null) {
-    return right === null ? null : secondKey(right);
+): number | null {
+  const leftSecond = left === null ? null : timestampSeconds(left);
+  const rightSecond = right === null ? null : timestampSeconds(right);
+  if (leftSecond === null) {
+    return rightSecond;
   }
-  if (right === null) {
-    return secondKey(left);
+  if (rightSecond === null) {
+    return leftSecond;
   }
-  const leftSecond = secondKey(left);
-  const rightSecond = secondKey(right);
   return leftSecond >= rightSecond ? leftSecond : rightSecond;
 }
 
 /**
- * Effective watermark second: `max(eventAt, snapshotAt)` at second
- * resolution. Arrival time is not an input.
+ * Effective watermark second: `max(eventAt, snapshotAt)` as a Unix second.
+ * Arrival time is not an input. Unparseable fields do not contribute.
  */
 export function effectiveWatermarkSecond(
   record: Pick<LedgerRecord, "eventAt" | "snapshotAt">,
-): string | null {
+): number | null {
   return maxSecond(record.eventAt, record.snapshotAt);
 }
 
@@ -282,7 +286,9 @@ function recordFromEvent(
  * The incoming event applies when there is no row, when its second is
  * strictly newer than `max(eventAt, snapshotAt)`, or when it shares that
  * second and outranks the stored status. Exact redelivery (same event id)
- * is a keep. Equal rank at the equal second drops the later arrival.
+ * is a keep. Equal rank at the equal second drops the later arrival. An
+ * existing row with no usable watermark is untrusted: keep, never apply
+ * because the event arrived.
  */
 export function decideLedgerApplication(
   current: LedgerRecord | null,
@@ -300,11 +306,14 @@ export function decideLedgerApplication(
   }
 
   const watermark = effectiveWatermarkSecond(current);
-  const incoming = secondKey(event.eventAt);
-  if (watermark !== null && incoming < watermark) {
+  const incoming = timestampSeconds(event.eventAt);
+  if (watermark === null || incoming === null) {
     return { action: "keep", reason: "stale" };
   }
-  if (watermark !== null && incoming === watermark) {
+  if (incoming < watermark) {
+    return { action: "keep", reason: "stale" };
+  }
+  if (incoming === watermark) {
     if (lifecycleRank(event.status) <= lifecycleRank(current.status)) {
       return { action: "keep", reason: "equal-rank" };
     }
