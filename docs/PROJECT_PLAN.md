@@ -2,8 +2,8 @@
 
 ## Status
 
-**Stage:** Phase 1 — arbitration core in-tree. Nothing is published.
-(`0.1.0`, unpublished.)
+**Stage:** Phase 2 — combinators and reservation in-tree. Nothing is
+published. (`0.1.0`, unpublished.)
 
 **Extraction source:** the RetireGolden account API's subscription ledger —
 `api/src/lib/repo.js` (`shouldApplyEvent`, `applySubscriptionSnapshot`,
@@ -160,13 +160,13 @@ posture.
 
 ## Delivery phases
 
-### Phase 1 — the arbitration core (this tree)
+### Phase 1 — the arbitration core
 
 Ledger collection, watermark, effective-watermark guard, lifecycle rank,
 equal-second tie-breaking. The reference implementation's race tests are
 the conformance bar; suite runs over memory and real Azurite.
 
-### Phase 2 — invariant combinators and the reservation
+### Phase 2 — invariant combinators and the reservation (this tree)
 
 `sticky` and `firstWins` as declared rules; the single-opportunity
 reservation with its read-winner-back semantics and TTL expiry.
@@ -191,11 +191,11 @@ acceptance bar.
 
 ## Timing
 
-Phase 1 is implemented in-tree. Later phases remain gated: combinators and
-reservation (Phase 2), snapshot reconciliation (Phase 3), and the Stripe
-adapter (Phase 4) wait until a named consumer needs them. Phase 5 (first
-consumer cutover) stays gated on that application's operational calendar —
-never swap code under a soak or mid-migration.
+Phase 2 is implemented in-tree. Later phases remain gated: snapshot
+reconciliation (Phase 3) and the Stripe adapter (Phase 4) wait until a
+named consumer needs them. Phase 5 (first consumer cutover) stays gated
+on that application's operational calendar — never swap code under a soak
+or mid-migration.
 
 ## Open questions
 
