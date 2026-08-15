@@ -88,6 +88,5 @@ clobber fresher fields. `snapshotAt` never jumps into a later Unix second
 than the sampled bound, so same-second webhooks still get lifecycle-rank
 arbitration. The watermark identity is never touched.
 
-Phase 3 is the arbitration core, combinators, reservation, and snapshot
-reconciliation. The Stripe adapter is a later phase — do not import it
-from this package.
+Phase 4 keeps this package provider-agnostic. Import Stripe translation
+from `@pegma/billing-stripe`, not from here.

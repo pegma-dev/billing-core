@@ -10,9 +10,9 @@ Thank you for helping improve Billing Core.
   violate (arrival-order application, payment processing, entitlements,
   receipt dedup, invoicing/tax/metering, or storing card data / payloads /
   amounts).
-- If a proposal needs this package to process payments or to create a
-  provider adapter before a consumer exists, say so explicitly — those are
-  the changes the design cannot absorb.
+- If a proposal needs this package to process payments, verify webhook
+  signatures, resolve entitlements, or swap a host `repo.js`, say so
+  explicitly — those are the changes the design cannot absorb.
 
 ## Local development
 
