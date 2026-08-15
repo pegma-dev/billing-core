@@ -1,5 +1,6 @@
 # Billing Core
 
+[![CI](https://github.com/pegma-dev/billing-core/actions/workflows/ci.yml/badge.svg)](https://github.com/pegma-dev/billing-core/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A provider-agnostic subscription ledger for [Pegma](https://pegma.dev)
@@ -7,9 +8,8 @@ hosts: the durable record of what a customer's subscription **is**,
 maintained correctly under out-of-order webhook delivery.
 
 > [!IMPORTANT]
-> Billing Core is in planning. Nothing is built or published; extraction
-> from the production reference implementation is scheduled deliberately.
-> See [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md).
+> Pegma is in early `0.x` development. `@pegma/billing-core` Phase 1 is
+> in-tree and unpublished. No public API is stable.
 
 ## The part everyone gets wrong
 
@@ -29,15 +29,13 @@ makes that impossible:
 - periodic **snapshot reconciliation** that repairs field drift without
   disturbing the dedup identity of the events themselves.
 
-Around that core: **declared ledger invariants** enforced inside the write
-path (`sticky` flags that only flip one way; `firstWins` consent capture
-that concurrent deliveries cannot violate) and an **atomic
-single-opportunity checkout reservation** for one-per-customer offers.
-
-Ships with a Stripe adapter; the core knows lifecycle states, not Stripe's
-vocabulary. And the data boundary is absolute: the ledger stores provider
-identifiers and derived state — never a card number, a raw payload, or an
-amount.
+Phase 1 ships the watermark, the effective-watermark guard, and
+lifecycle-rank arbitration. Snapshot reconciliation, declared ledger
+invariants (`sticky`, `firstWins`), and the checkout reservation are later
+phases. Ships later with a Stripe adapter; the core knows lifecycle
+states, not Stripe's vocabulary. And the data boundary is absolute: the
+ledger stores provider identifiers and derived state — never a card
+number, a raw payload, or an amount.
 
 Not here, on purpose: payment processing and checkout flows, entitlement
 resolution ([Authorization Core](https://github.com/pegma-dev/authorization-core)'s
@@ -54,6 +52,40 @@ entitlements. Extracted from the RetireGolden account API's
 production-tested subscription ledger, the ecosystem's reference
 application.
 
+## Packages
+
+| Package                 | Role                                           | Phase |
+| ----------------------- | ---------------------------------------------- | ----- |
+| `@pegma/billing-core`   | Ledger collection, watermark, rank arbitration | 1     |
+| `@pegma/billing-stripe` | Event and snapshot translation                 | later |
+
+The Stripe adapter package is not created until Phase 4.
+
+## Constraint that shapes everything
+
+**Arrival order proves nothing.** Every apply goes through the
+effective-watermark guard and lifecycle rank. Race tests over the memory
+store and real Azurite are the specification.
+
+## Documentation
+
+- [Project plan](docs/PROJECT_PLAN.md) — phases, scope, and decisions
+- [Releasing](docs/RELEASING.md) — trusted-publisher release runbook
+
+## Development
+
+Requires Node.js 22 or 24. Corepack is bundled through Node 24; on Node 25
+or newer, install it first.
+
+```sh
+npm install -g corepack
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run format:check
+pnpm run check
+pnpm test
+```
+
 ## License
 
-MIT © RetireGolden, LLC
+[MIT](LICENSE) © 2026 RetireGolden, LLC

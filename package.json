@@ -1,0 +1,39 @@
+{
+  "name": "billing-core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Provider-agnostic subscription ledger for Pegma hosts.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "check": "tsc -b --pretty false && tsc -p tsconfig.test.json --pretty false",
+    "clean": "tsc -b --clean",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "release:check": "node scripts/release-packages.mjs check",
+    "release:pack": "node scripts/release-packages.mjs pack",
+    "release:publish": "node scripts/release-packages.mjs publish",
+    "test": "pnpm run build && vitest run"
+  },
+  "devDependencies": {
+    "@azure/data-tables": "^13.3.1",
+    "@pegma/storage-azure-tables": "0.4.0",
+    "@types/node": "^26.1.1",
+    "azurite": "^3.36.0",
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "pnpm": {
+    "overrides": {
+      "brace-expansion": "^5.0.8",
+      "uuid": "^11.1.1",
+      "@opentelemetry/core": "^2.8.0"
+    }
+  }
+}

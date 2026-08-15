@@ -8,9 +8,7 @@ Billing Core is the subscription ledger of **Pegma**, a family of
 MIT-licensed packages a host application composes. Shared contracts live
 in `@pegma/spine`; persistence in `@pegma/storage-core`; receipt dedup in
 `@pegma/webhooks`; entitlement resolution in `@pegma/authorization-core`.
-One repository per component, publishing under the `@pegma` scope. This
-repository is plan-only until the extraction trigger in
-`docs/PROJECT_PLAN.md` fires.
+One repository per component, publishing under the `@pegma` scope.
 
 The governing principle, which every rule below follows from:
 
@@ -61,6 +59,56 @@ non-goals). Refuse regardless of how small the request looks.
 Azurite; the named scenarios — out-of-order application, same-second
 rank arbitration, delayed-intermediate-after-sweep, concurrent
 reservation, invariant races — are the specification.
+
+**Injected Clock and Logger only.** Never call `Date.now()` on a
+production path. Log outcomes coarsely (account id, event id, applied) —
+never payloads, amounts, or customer content.
+
+**Pin `@pegma/*` deps exactly.** A caret would let CI resolve a version
+nobody tested against.
+
+**Never write literal control characters into source.** Write them as escape
+sequences such as backslash-u-0000 through backslash-u-001F, and verify the
+bytes after any tool-assisted edit.
+
+## Packaging traps already paid for
+
+Each published package needs its **own** README and LICENSE inside the package
+directory; npm ignores files at the repository root. Each needs `prepack`
+running the build. Each package `tsconfig.json` must exclude
+`src/**/*.test.ts`, or compiled tests ship to consumers.
+
+`runNpm` / release scripts must invoke a real npm CLI. Ignore `npm_execpath`
+when pnpm set it, or pack/publish silently go through pnpm.
+
+Lockfile sync: pnpm importers only record dependencies / devDependencies /
+optionalDependencies. Do not require an importer `peerDependencies` section.
+Caret-zero follows npm (`^0` → `<1.0.0`, `^0.0` → `<0.1.0`, `^0.0.3` is only
+`0.0.3`). Exact prerelease pins match by identity. Strip pnpm peer suffixes
+at the first `(`.
+
+## Workflow
+
+Work on a `cursor/*` branch and open a pull request. The gate is
+`pnpm run format:check`, `pnpm run check`, `pnpm test` — all three, on Node 22
+and 24.
+
+Publishing is trusted-publisher only; no tokens exist. A release starts from a
+protected signed annotated `vX.Y.Z` tag already on `origin/main`, followed by
+`gh release create vX.Y.Z --verify-tag`. See `docs/RELEASING.md`.
+
+## Where things stand
+
+Phase 1: `@pegma/billing-core` (ledger collection, `(eventAt, eventId)`
+watermark, effective-watermark guard, lifecycle-rank tie-break). Nothing is
+published. Invariant combinators and reservation are Phase 2; snapshot
+reconciliation is Phase 3; `@pegma/billing-stripe` is Phase 4 — do not
+create those packages here yet.
+
+Siblings: [spine](https://github.com/pegma-dev/spine),
+[storage-core](https://github.com/pegma-dev/storage-core),
+[webhooks](https://github.com/pegma-dev/webhooks),
+[authorization-core](https://github.com/pegma-dev/authorization-core).
 
 ## Reference points
 

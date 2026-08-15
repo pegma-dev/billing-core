@@ -2,9 +2,8 @@
 
 ## Status
 
-**Stage:** planning; nothing extracted yet. Implementation is scheduled
-deliberately — the extraction source must finish its current migrations
-first (see Timing). (`0.x`, unpublished.)
+**Stage:** Phase 1 — arbitration core in-tree. Nothing is published.
+(`0.1.0`, unpublished.)
 
 **Extraction source:** the RetireGolden account API's subscription ledger —
 `api/src/lib/repo.js` (`shouldApplyEvent`, `applySubscriptionSnapshot`,
@@ -22,7 +21,7 @@ time and logging from `@pegma/spine`. Pinned exactly.
 ## Vision
 
 Every subscription SaaS keeps a durable record of what each customer's
-subscription *is*, and nearly all of them maintain it wrong in the same
+subscription _is_, and nearly all of them maintain it wrong in the same
 quiet way: billing providers deliver webhooks at-least-once and out of
 order, and a ledger that applies events in arrival order will eventually
 let a stale `active` resurrect a subscription that a same-second
@@ -38,9 +37,9 @@ wires an adapter and gets the part everyone gets wrong, already right.
 
 Between two components that deliberately refuse this job:
 [`@pegma/webhooks`](https://github.com/pegma-dev/webhooks) dedupes
-*receipts* and explicitly excludes ordering ("domain logic"); Authorization
+_receipts_ and explicitly excludes ordering ("domain logic"); Authorization
 Core's Stripe adapter collapses ledger state into active-or-absent
-*entitlements* and explicitly has no expiry or lifecycle semantics. The
+_entitlements_ and explicitly has no expiry or lifecycle semantics. The
 ordering and invariant semantics in the middle are owned by nobody — this
 component is that middle. A typical host pipeline:
 provider webhook → webhooks receipt (dedup) → **billing-core (arbitrate,
@@ -140,8 +139,8 @@ translation, not a ledger.
 - **Processing payments, checkout UI, or provider API orchestration
   beyond the adapter's event/snapshot translation.** Hosts call their
   provider's SDK for checkout and portal flows.
-- **Entitlement resolution.** What a subscription *grants* is
-  Authorization Core's job; this ledger is what the subscription *is*.
+- **Entitlement resolution.** What a subscription _grants_ is
+  Authorization Core's job; this ledger is what the subscription _is_.
 - **Receipt dedup and webhook authenticity.** `@pegma/webhooks` and the
   host, respectively.
 - **Invoicing, tax, metering, usage billing, dunning orchestration.**
@@ -161,7 +160,7 @@ posture.
 
 ## Delivery phases
 
-### Phase 1 — the arbitration core
+### Phase 1 — the arbitration core (this tree)
 
 Ledger collection, watermark, effective-watermark guard, lifecycle rank,
 equal-second tie-breaking. The reference implementation's race tests are
@@ -192,12 +191,11 @@ acceptance bar.
 
 ## Timing
 
-Behind the current workstreams deliberately: the extraction source is the
-same file the authorization-core migration touches (entitlement seam) and
-its production posture is still settling. Extract when `repo.js` is quiet.
-The plan exists now so the decisions — the always-write rule, the domain
-CAS token, rank-based tie-breaking, the combinator generalization — are
-already made when that day comes.
+Phase 1 is implemented in-tree. Later phases remain gated: combinators and
+reservation (Phase 2), snapshot reconciliation (Phase 3), and the Stripe
+adapter (Phase 4) wait until a named consumer needs them. Phase 5 (first
+consumer cutover) stays gated on that application's operational calendar —
+never swap code under a soak or mid-migration.
 
 ## Open questions
 
