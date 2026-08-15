@@ -23,8 +23,10 @@ import {
   billingLedgerKey,
   createBillingLedger,
   decideLedgerApplication,
+  decideLedgerSnapshot,
   decideReservation,
   DEFAULT_RESERVATION_TTL_MS,
+  DEFAULT_SWEEP_LIMIT,
   effectiveWatermarkSecond,
   firstWins,
   hasReservationProvenance,
@@ -33,10 +35,14 @@ import {
   isGrantingStatus,
   LIFECYCLE_RANK,
   lifecycleRank,
+  observeSnapshot,
+  observeWatermark,
   reservationIsLive,
   sticky,
+  watermarksMatch,
   type LedgerEvent,
   type LedgerRecord,
+  type LedgerSnapshot,
 } from "./index.js";
 
 declare module "vitest" {
@@ -93,6 +99,24 @@ function event<THost extends object = {}>(
   };
 }
 
+function snapshot<THost extends object = {}>(
+  overrides: Partial<LedgerSnapshot<THost>> = {},
+): LedgerSnapshot<THost> {
+  return {
+    status: "active",
+    providerCustomerId: "cus_123",
+    providerSubscriptionId: "sub_123",
+    providerPriceId: "price_pro",
+    plan: "pro",
+    periodStartAt: "2026-08-01T00:00:00.000Z",
+    periodEndAt: "2026-09-01T00:00:00.000Z",
+    trialStartAt: null,
+    trialEndAt: null,
+    cancelAtPeriodEnd: false,
+    ...overrides,
+  };
+}
+
 function record(
   accountId: string,
   overrides: Partial<LedgerRecord> = {},
@@ -112,6 +136,7 @@ function record(
     eventAt: SECOND,
     eventId: "evt_seed",
     snapshotAt: null,
+    snapshotGeneration: 0,
     reservationId: null,
     reservationExpiresAt: null,
     reservationSeeded: false,
@@ -773,6 +798,7 @@ describe("billing ledger codec", () => {
       eventAt: SECOND,
       eventId: "evt_seed",
       snapshotAt: null,
+      snapshotGeneration: 0,
       reservationId: null,
       reservationExpiresAt: null,
       reservationSeeded: false,
@@ -1424,6 +1450,7 @@ describe("declared invariants", () => {
       eventAt: SECOND,
       eventId: "evt_seed",
       snapshotAt: null,
+      snapshotGeneration: 0,
       reservationId: null,
       reservationExpiresAt: null,
       reservationSeeded: false,
@@ -1607,5 +1634,732 @@ describe("checkout reservation decider", () => {
     expect(DEFAULT_RESERVATION_TTL_MS).toBe(30 * 60 * 1000);
     expect(isGrantingStatus("active")).toBe(true);
     expect(isGrantingStatus("canceled")).toBe(false);
+  });
+});
+
+describe("snapshot decider", () => {
+  it("always writes on a token match even when no field changed", () => {
+    const current = record("acct", { snapshotAt: null });
+    const decision = decideLedgerSnapshot(
+      current,
+      observeSnapshot(current),
+      snapshot(),
+      SNAPSHOT_BOUND,
+    );
+    expect(decision).toMatchObject({
+      action: "write",
+      value: {
+        eventId: "evt_seed",
+        eventAt: SECOND,
+        snapshotAt: SNAPSHOT_BOUND,
+        snapshotGeneration: 1,
+        status: "active",
+        plan: "pro",
+      },
+    });
+  });
+
+  it("repairs field drift without touching watermark identity", () => {
+    const current = record("acct", { plan: "stale", snapshotAt: EARLIER });
+    const decision = decideLedgerSnapshot(
+      current,
+      observeSnapshot(current),
+      snapshot({ plan: "pro", status: "past_due" }),
+      SNAPSHOT_BOUND,
+    );
+    expect(decision.action).toBe("write");
+    if (decision.action !== "write") {
+      return;
+    }
+    expect(decision.value).toMatchObject({
+      plan: "pro",
+      status: "past_due",
+      eventId: "evt_seed",
+      eventAt: SECOND,
+      snapshotAt: SNAPSHOT_BOUND,
+    });
+  });
+
+  it("drops the snapshot when the observed token no longer matches", () => {
+    expect(
+      decideLedgerSnapshot(
+        record("acct", { eventId: "evt_newer", eventAt: LATER }),
+        {
+          eventAt: SECOND,
+          eventId: "evt_seed",
+          snapshotAt: null,
+          snapshotGeneration: 0,
+        },
+        snapshot({ plan: "should-not-land" }),
+        SNAPSHOT_BOUND,
+      ),
+    ).toEqual({ action: "keep", reason: "intervening-write" });
+  });
+
+  it("does not create a row when none was observed", () => {
+    expect(
+      decideLedgerSnapshot(
+        null,
+        {
+          eventAt: SECOND,
+          eventId: "evt_seed",
+          snapshotAt: null,
+          snapshotGeneration: 0,
+        },
+        snapshot(),
+        SNAPSHOT_BOUND,
+      ),
+    ).toEqual({ action: "keep", reason: "missing" });
+  });
+
+  it("does not regress snapshotAt when the incoming bound is older", () => {
+    const current = record("acct", { snapshotAt: SNAPSHOT_BOUND });
+    const decision = decideLedgerSnapshot(
+      current,
+      observeSnapshot(current),
+      snapshot(),
+      SECOND,
+    );
+    expect(decision).toMatchObject({
+      action: "write",
+      value: {
+        snapshotAt: SNAPSHOT_BOUND,
+        snapshotGeneration: 1,
+        eventId: "evt_seed",
+      },
+    });
+  });
+
+  it("increments snapshotGeneration on a same-bound write so the next CAS drops", () => {
+    const current = record("acct", { snapshotAt: SECOND, plan: "fresh" });
+    const first = decideLedgerSnapshot(
+      current,
+      observeSnapshot(current),
+      snapshot({ plan: "fresh" }),
+      SECOND,
+    );
+    expect(first).toMatchObject({
+      action: "write",
+      value: {
+        snapshotAt: SECOND,
+        snapshotGeneration: 1,
+        plan: "fresh",
+      },
+    });
+    if (first.action !== "write") {
+      return;
+    }
+    expect(
+      decideLedgerSnapshot(
+        first.value,
+        observeSnapshot(current),
+        snapshot({ plan: "stale-fetch" }),
+        SECOND,
+      ),
+    ).toEqual({ action: "keep", reason: "superseded" });
+  });
+
+  it("re-evaluates sticky and firstWins against the freshly read row", () => {
+    const current = {
+      ...record("acct"),
+      foundingMember: true,
+      consentAt: EARLIER,
+      consentVersion: "first",
+    };
+    const decision = decideLedgerSnapshot(
+      current,
+      observeSnapshot(current),
+      snapshot({
+        fields: {
+          foundingMember: false,
+          consentAt: LATER,
+          consentVersion: "second",
+        },
+      }),
+      SNAPSHOT_BOUND,
+      HOST_FIELDS,
+    );
+    expect(decision).toMatchObject({
+      action: "write",
+      value: {
+        foundingMember: true,
+        consentAt: EARLIER,
+        consentVersion: "first",
+        eventId: "evt_seed",
+      },
+    });
+  });
+
+  it("refuses a (null, null) token match on an eventless row", () => {
+    const reserved = decideReservation(
+      null,
+      "acct_blank",
+      SECOND,
+      "rsv_1",
+      LATER,
+    );
+    expect(reserved.action).toBe("write");
+    if (reserved.action !== "write") {
+      return;
+    }
+    expect(isEventlessLedgerRow(reserved.value)).toBe(true);
+    expect(
+      decideLedgerSnapshot(
+        reserved.value,
+        observeSnapshot(reserved.value),
+        snapshot({ status: "active", plan: "invented" }),
+        SNAPSHOT_BOUND,
+      ),
+    ).toEqual({ action: "keep", reason: "eventless" });
+  });
+
+  it("drops a snapshot superseded by a newer snapshotAt on the same event token", () => {
+    expect(
+      decideLedgerSnapshot(
+        record("acct", { snapshotAt: SNAPSHOT_BOUND, plan: "fresh" }),
+        {
+          eventAt: SECOND,
+          eventId: "evt_seed",
+          snapshotAt: null,
+          snapshotGeneration: 0,
+        },
+        snapshot({ plan: "stale-fetch" }),
+        SECOND,
+      ),
+    ).toEqual({ action: "keep", reason: "superseded" });
+  });
+
+  it("treats (eventAt, eventId) as the token, not a storage version", () => {
+    const current = record("acct", { plan: "kept-identity" });
+    expect(observeWatermark(current)).toEqual({
+      eventAt: SECOND,
+      eventId: "evt_seed",
+    });
+    expect(
+      watermarksMatch(current, { eventAt: SECOND, eventId: "evt_seed" }),
+    ).toBe(true);
+    expect(
+      watermarksMatch(current, { eventAt: SECOND, eventId: "evt_other" }),
+    ).toBe(false);
+    expect(DEFAULT_SWEEP_LIMIT).toBe(100);
+  });
+});
+
+function snapshotReconciliation(name: string, freshStore: () => Store): void {
+  describe(name, () => {
+    it("delayed-intermediate-webhook-after-sweep", async () => {
+      const clock = controllableClock(EARLIER);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_delayed_after_sweep",
+        event("evt_applied", { eventAt: EARLIER, status: "active" }),
+      );
+
+      clock.set(SNAPSHOT_BOUND);
+      const swept = await ledger.reconcile(
+        "acct_delayed_after_sweep",
+        async (observed) => snapshot({ plan: observed.plan }),
+      );
+      expect(swept.written).toBe(true);
+      if (!swept.written) {
+        throw new Error("expected snapshot write");
+      }
+      expect(swept.record.snapshotAt).toBe(SNAPSHOT_BOUND);
+      expect(swept.record.eventId).toBe("evt_applied");
+      expect(swept.record.eventAt).toBe(EARLIER);
+
+      const delayed = await ledger.apply(
+        "acct_delayed_after_sweep",
+        event("evt_delayed_intermediate", {
+          eventAt: SECOND,
+          status: "past_due",
+          plan: "should-not-land",
+        }),
+      );
+      expect(delayed.applied).toBe(false);
+      expect(await ledger.get("acct_delayed_after_sweep")).toMatchObject({
+        status: "active",
+        eventId: "evt_applied",
+        eventAt: EARLIER,
+        snapshotAt: SNAPSHOT_BOUND,
+        plan: "pro",
+      });
+    });
+
+    it("intervening-write drops snapshot", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_intervening",
+        event("evt_seed", { eventAt: EARLIER, plan: "original" }),
+      );
+
+      const result = await ledger.reconcile("acct_intervening", async () => {
+        await ledger.apply(
+          "acct_intervening",
+          event("evt_newer", {
+            eventAt: LATER,
+            status: "canceled",
+            plan: "from-event",
+          }),
+        );
+        return snapshot({ plan: "from-stale-fetch", status: "active" });
+      });
+      expect(result).toMatchObject({
+        written: false,
+        reason: "intervening-write",
+      });
+      expect(await ledger.get("acct_intervening")).toMatchObject({
+        status: "canceled",
+        eventId: "evt_newer",
+        eventAt: LATER,
+        plan: "from-event",
+        snapshotAt: null,
+      });
+    });
+
+    it("no-op still advances snapshotAt", async () => {
+      const clock = controllableClock(SECOND);
+      const base = freshStore();
+      const tracked = trackLedgerStorage(base);
+      const ledger = createBillingLedger({ store: tracked.store, clock });
+      await ledger.apply("acct_noop_sweep", event("evt_seed"));
+      const before = await ledger.get("acct_noop_sweep");
+      expect(before?.snapshotAt).toBeNull();
+      const updatesAfterApply = tracked.calls.update;
+
+      clock.set(SNAPSHOT_BOUND);
+      const result = await ledger.reconcile(
+        "acct_noop_sweep",
+        async (observed) =>
+          snapshot({
+            status: observed.status,
+            plan: observed.plan,
+            providerCustomerId: observed.providerCustomerId,
+            providerSubscriptionId: observed.providerSubscriptionId,
+            providerPriceId: observed.providerPriceId,
+            periodStartAt: observed.periodStartAt,
+            periodEndAt: observed.periodEndAt,
+            trialStartAt: observed.trialStartAt,
+            trialEndAt: observed.trialEndAt,
+            cancelAtPeriodEnd: observed.cancelAtPeriodEnd,
+          }),
+      );
+      expect(result.written).toBe(true);
+      expect(tracked.calls.update).toBeGreaterThan(updatesAfterApply);
+      expect(result.record).toMatchObject({
+        eventId: "evt_seed",
+        eventAt: SECOND,
+        snapshotAt: SNAPSHOT_BOUND,
+        status: "active",
+        plan: "pro",
+      });
+      expect(await ledger.get("acct_noop_sweep")).toEqual(result.record);
+    });
+
+    it("samples snapshotAt before fetch so a later cancel webhook can still apply", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_bound_before_fetch",
+        event("evt_applied", { eventAt: EARLIER, status: "active" }),
+      );
+
+      const swept = await ledger.reconcile(
+        "acct_bound_before_fetch",
+        async () => {
+          clock.set(SNAPSHOT_BOUND);
+          return snapshot({ status: "active" });
+        },
+      );
+      expect(swept.written).toBe(true);
+      if (!swept.written) {
+        throw new Error("expected snapshot write");
+      }
+      expect(swept.record.snapshotAt).toBe(SECOND);
+
+      const canceled = await ledger.apply(
+        "acct_bound_before_fetch",
+        event("evt_canceled", {
+          eventAt: LATER,
+          status: "canceled",
+        }),
+      );
+      expect(canceled.applied).toBe(true);
+      expect(canceled.record).toMatchObject({
+        status: "canceled",
+        eventId: "evt_canceled",
+        eventAt: LATER,
+        snapshotAt: SECOND,
+      });
+    });
+
+    it("overlapping same-bound sweeps do not clobber fresher fields", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_same_bound",
+        event("evt_seed", { plan: "original" }),
+      );
+      const seeded = await ledger.reconcile("acct_same_bound", async () =>
+        snapshot({ plan: "original" }),
+      );
+      expect(seeded.written).toBe(true);
+      if (!seeded.written) {
+        throw new Error("expected seed snapshot write");
+      }
+      expect(seeded.record.snapshotAt).toBe(SECOND);
+
+      let releaseSlow = () => {};
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      let slowStarted = () => {};
+      const slowIsFetching = new Promise<void>((resolve) => {
+        slowStarted = resolve;
+      });
+
+      const slow = ledger.reconcile("acct_same_bound", async () => {
+        slowStarted();
+        await slowGate;
+        return snapshot({ plan: "stale-fetch", status: "active" });
+      });
+      await slowIsFetching;
+
+      const fast = await ledger.reconcile("acct_same_bound", async () =>
+        snapshot({ plan: "fresh-truth", status: "canceled" }),
+      );
+      expect(fast.written).toBe(true);
+      if (!fast.written) {
+        throw new Error("expected fast snapshot write");
+      }
+      expect(fast.record.snapshotAt).toBe(SECOND);
+      expect(fast.record.snapshotGeneration).toBe(2);
+      releaseSlow();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+      expect(await ledger.get("acct_same_bound")).toMatchObject({
+        plan: "fresh-truth",
+        status: "canceled",
+        eventId: "evt_seed",
+        snapshotAt: SECOND,
+        snapshotGeneration: 2,
+      });
+    });
+
+    it("overlapping .999Z reconcile does not stale a same-second webhook", async () => {
+      const endOfSecond = "2026-08-15T16:00:00.999Z";
+      const clock = controllableClock(endOfSecond);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_end_of_second",
+        event("evt_applied", { eventAt: SECOND, status: "active" }),
+      );
+      const seeded = await ledger.reconcile("acct_end_of_second", async () =>
+        snapshot({ status: "active" }),
+      );
+      expect(seeded.written).toBe(true);
+      if (!seeded.written) {
+        throw new Error("expected seed snapshot write");
+      }
+      expect(seeded.record.snapshotAt).toBe(endOfSecond);
+      expect(effectiveWatermarkSecond(seeded.record)).toBe(unixSecond(SECOND));
+
+      let releaseSlow = () => {};
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      let slowStarted = () => {};
+      const slowIsFetching = new Promise<void>((resolve) => {
+        slowStarted = resolve;
+      });
+
+      const slow = ledger.reconcile("acct_end_of_second", async () => {
+        slowStarted();
+        await slowGate;
+        return snapshot({ plan: "stale-fetch", status: "active" });
+      });
+      await slowIsFetching;
+
+      const fast = await ledger.reconcile("acct_end_of_second", async () =>
+        snapshot({ plan: "fresh-truth", status: "active" }),
+      );
+      expect(fast.written).toBe(true);
+      if (!fast.written) {
+        throw new Error("expected fast snapshot write");
+      }
+      expect(fast.record.snapshotAt).toBe(endOfSecond);
+      expect(effectiveWatermarkSecond(fast.record)).toBe(unixSecond(SECOND));
+      releaseSlow();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+
+      const canceled = await ledger.apply(
+        "acct_end_of_second",
+        event("evt_canceled", {
+          eventAt: SAME_SECOND_LATER_MS,
+          status: "canceled",
+        }),
+      );
+      expect(canceled.applied).toBe(true);
+      expect(canceled.record).toMatchObject({
+        status: "canceled",
+        eventId: "evt_canceled",
+        eventAt: SAME_SECOND_LATER_MS,
+        snapshotAt: endOfSecond,
+      });
+    });
+
+    it("overlapping sweep does not clobber a newer snapshot", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_overlap",
+        event("evt_seed", { plan: "original" }),
+      );
+
+      let releaseSlow = () => {};
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      let slowStarted = () => {};
+      const slowIsFetching = new Promise<void>((resolve) => {
+        slowStarted = resolve;
+      });
+
+      const slow = ledger.reconcile("acct_overlap", async () => {
+        slowStarted();
+        await slowGate;
+        return snapshot({ plan: "stale-fetch", status: "active" });
+      });
+      await slowIsFetching;
+
+      clock.set(SNAPSHOT_BOUND);
+      const fast = await ledger.reconcile("acct_overlap", async () =>
+        snapshot({ plan: "fresh-truth", status: "canceled" }),
+      );
+      expect(fast.written).toBe(true);
+      releaseSlow();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+      expect(await ledger.get("acct_overlap")).toMatchObject({
+        plan: "fresh-truth",
+        status: "canceled",
+        eventId: "evt_seed",
+        snapshotAt: SNAPSHOT_BOUND,
+      });
+    });
+
+    it("does not snapshot a reservation-only row so a founding webhook can still apply", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      const reserved = await ledger.reserve("acct_eventless_snap");
+      expect(reserved.reserved).toBe(true);
+
+      let fetched = 0;
+      const result = await ledger.reconcile("acct_eventless_snap", async () => {
+        fetched += 1;
+        return snapshot({ status: "active", plan: "invented" });
+      });
+      expect(result).toMatchObject({
+        written: false,
+        reason: "eventless",
+      });
+      expect(fetched).toBe(0);
+      const held = await ledger.get("acct_eventless_snap");
+      expect(held && isEventlessLedgerRow(held)).toBe(true);
+      expect(held?.snapshotAt).toBeNull();
+      expect(held?.plan).toBeNull();
+
+      const founding = await ledger.apply(
+        "acct_eventless_snap",
+        event("evt_founding", { eventAt: EARLIER, status: "active" }),
+      );
+      expect(founding.applied).toBe(true);
+      expect(founding.record).toMatchObject({
+        eventId: "evt_founding",
+        eventAt: EARLIER,
+        status: "active",
+        snapshotAt: null,
+      });
+    });
+
+    it("fetches provider truth only after observing the watermark", async () => {
+      const clock = controllableClock(SECOND);
+      const base = freshStore();
+      const order: string[] = [];
+      const tracked: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const delegate = base.collection(definition);
+          return {
+            ...delegate,
+            async get(key) {
+              order.push("observe");
+              return delegate.get(key);
+            },
+            async update(key, decide, updateOptions) {
+              order.push("update");
+              return delegate.update(key, decide, updateOptions);
+            },
+          };
+        },
+      };
+      const ledger = createBillingLedger({
+        store: tracked,
+        clock,
+      });
+      await ledger.apply("acct_observe_first", event("evt_seed"));
+      order.length = 0;
+      await ledger.reconcile("acct_observe_first", async (observed) => {
+        order.push("fetch");
+        expect(observed.eventId).toBe("evt_seed");
+        expect(observed.eventAt).toBe(SECOND);
+        return snapshot();
+      });
+      expect(order).toEqual(["observe", "fetch", "update"]);
+    });
+
+    it("sweep pages accounts and writes each observed row", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply("acct_sweep_a", event("evt_a", { plan: "a" }));
+      await ledger.apply("acct_sweep_b", event("evt_b", { plan: "b" }));
+
+      const first = await ledger.sweep(
+        async (observed) => snapshot({ plan: observed.plan }),
+        {
+          limit: 1,
+        },
+      );
+      expect(first.results).toHaveLength(1);
+      expect(first.results[0]?.written).toBe(true);
+      expect(first.nextCursor).not.toBeNull();
+
+      const second = await ledger.sweep(
+        async (observed) => snapshot({ plan: observed.plan }),
+        first.nextCursor === null
+          ? { limit: 1 }
+          : { limit: 1, cursor: first.nextCursor },
+      );
+      expect(second.results).toHaveLength(1);
+      expect(second.results[0]?.written).toBe(true);
+      expect(second.nextCursor).toBeNull();
+
+      expect(await ledger.get("acct_sweep_a")).toMatchObject({
+        snapshotAt: SNAPSHOT_BOUND,
+        eventId: "evt_a",
+        plan: "a",
+      });
+      expect(await ledger.get("acct_sweep_b")).toMatchObject({
+        snapshotAt: SNAPSHOT_BOUND,
+        eventId: "evt_b",
+        plan: "b",
+      });
+    });
+
+    it("skips a missing account and a null provider fetch without writing", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const base = freshStore();
+      const tracked = trackLedgerStorage(base);
+      const ledger = createBillingLedger({ store: tracked.store, clock });
+      await ledger.apply("acct_present", event("evt_seed"));
+      const updatesAfterApply = tracked.calls.update;
+
+      expect(
+        await ledger.reconcile("acct_missing", async () => snapshot()),
+      ).toEqual({
+        written: false,
+        record: null,
+        reason: "missing",
+      });
+      expect(
+        await ledger.reconcile("acct_present", async () => null),
+      ).toMatchObject({
+        written: false,
+        reason: "unavailable",
+        record: { eventId: "evt_seed", snapshotAt: null },
+      });
+      expect(tracked.calls.update).toBe(updatesAfterApply);
+    });
+
+    it("logs snapshot outcomes without payload or amount fields", async () => {
+      const entries: Array<{
+        level: string;
+        message: string;
+        fields?: Readonly<Record<string, unknown>>;
+      }> = [];
+      const logger: Logger = {
+        log(level, message, fields) {
+          entries.push({
+            level,
+            message,
+            ...(fields === undefined ? {} : { fields }),
+          });
+        },
+      };
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const ledger = createBillingLedger({
+        store: freshStore(),
+        clock,
+        logger,
+      });
+      await ledger.apply("acct_snap_log", event("evt_seed"));
+      entries.length = 0;
+      await ledger.reconcile("acct_snap_log", async () => snapshot());
+      await ledger.reconcile("acct_snap_missing", async () => snapshot());
+
+      expect(entries).toEqual([
+        {
+          level: "info",
+          message: "Billing ledger snapshot written",
+          fields: {
+            accountId: "acct_snap_log",
+            eventId: "evt_seed",
+            written: true,
+          },
+        },
+        {
+          level: "info",
+          message: "Billing ledger snapshot ignored",
+          fields: {
+            accountId: "acct_snap_missing",
+            written: false,
+          },
+        },
+      ]);
+      expect(JSON.stringify(entries)).not.toContain("payload");
+      expect(JSON.stringify(entries)).not.toContain("amount");
+    });
+  });
+}
+
+snapshotReconciliation("snapshot reconciliation / memory", createMemoryStore);
+snapshotReconciliation(
+  "snapshot reconciliation / Azure Tables",
+  freshAzureStore,
+);
+
+describe("snapshot reconciliation clock discipline", () => {
+  it("requires an injected clock and never uses Date.now for snapshotAt", async () => {
+    const ledger = createBillingLedger({ store: createMemoryStore() });
+    await expect(
+      ledger.reconcile("acct_no_clock", async () => snapshot()),
+    ).rejects.toThrow(/Clock/);
+    await expect(ledger.sweep(async () => snapshot())).rejects.toThrow(/Clock/);
+    expect(DEFAULT_SWEEP_LIMIT).toBe(100);
   });
 });

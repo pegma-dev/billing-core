@@ -2,7 +2,7 @@
 
 ## Status
 
-**Stage:** Phase 2 — combinators and reservation in-tree. Nothing is
+**Stage:** Phase 3 — snapshot reconciliation in-tree. Nothing is
 published. (`0.1.0`, unpublished.)
 
 **Extraction source:** the RetireGolden account API's subscription ledger —
@@ -166,12 +166,12 @@ Ledger collection, watermark, effective-watermark guard, lifecycle rank,
 equal-second tie-breaking. The reference implementation's race tests are
 the conformance bar; suite runs over memory and real Azurite.
 
-### Phase 2 — invariant combinators and the reservation (this tree)
+### Phase 2 — invariant combinators and the reservation
 
 `sticky` and `firstWins` as declared rules; the single-opportunity
 reservation with its read-winner-back semantics and TTL expiry.
 
-### Phase 3 — snapshot reconciliation
+### Phase 3 — snapshot reconciliation (this tree)
 
 The sweep, the domain CAS token, the always-write freshness rule — with
 the delayed-intermediate-webhook scenario pinned as a named test.
@@ -191,11 +191,10 @@ acceptance bar.
 
 ## Timing
 
-Phase 2 is implemented in-tree. Later phases remain gated: snapshot
-reconciliation (Phase 3) and the Stripe adapter (Phase 4) wait until a
-named consumer needs them. Phase 5 (first consumer cutover) stays gated
-on that application's operational calendar — never swap code under a soak
-or mid-migration.
+Phase 3 is implemented in-tree. Later phases remain gated: the Stripe
+adapter (Phase 4) waits until a named consumer needs it. Phase 5 (first
+consumer cutover) stays gated on that application's operational calendar
+— never swap code under a soak or mid-migration.
 
 ## Open questions
 
