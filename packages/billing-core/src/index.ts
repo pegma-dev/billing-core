@@ -576,22 +576,28 @@ function assertSweepLimit(limit: number): number {
   return limit;
 }
 
-function laterTimestamp(
-  left: IsoTimestamp | null,
-  right: IsoTimestamp,
+/**
+ * Every successful snapshot write must persist a strictly later
+ * `snapshotAt` than the row already holds. Equality is not enough: two
+ * reconciles that observed the same bound would both pass the CAS check
+ * and the slower fetch could clobber fresher fields.
+ */
+function advancingSnapshotAt(
+  current: IsoTimestamp | null,
+  incoming: IsoTimestamp,
 ): IsoTimestamp {
-  if (left === null) {
-    return right;
+  if (current === null) {
+    return incoming;
   }
-  const leftMs = canonicalTimestampMilliseconds(left);
-  const rightMs = canonicalTimestampMilliseconds(right);
-  if (leftMs === null) {
-    return right;
+  const currentMs = canonicalTimestampMilliseconds(current);
+  const incomingMs = canonicalTimestampMilliseconds(incoming);
+  if (currentMs === null) {
+    return incoming;
   }
-  if (rightMs === null) {
-    return left;
+  if (incomingMs !== null && incomingMs > currentMs) {
+    return incoming;
   }
-  return leftMs >= rightMs ? left : right;
+  return addMilliseconds(current, 1);
 }
 
 /** Reads the domain CAS token from a ledger row. */
@@ -1025,7 +1031,7 @@ function projectSnapshotRecord<THost extends HostFields>(
     cancelAtPeriodEnd: snapshot.cancelAtPeriodEnd,
     eventAt: current.eventAt,
     eventId: current.eventId,
-    snapshotAt: laterTimestamp(current.snapshotAt, snapshotAt),
+    snapshotAt: advancingSnapshotAt(current.snapshotAt, snapshotAt),
     reservationId: granting ? null : (current.reservationId ?? null),
     reservationExpiresAt: granting
       ? null
@@ -1047,10 +1053,11 @@ function projectSnapshotRecord<THost extends HostFields>(
  * has no event identity to repair — refuse a `(null, null)` match so a
  * founding webhook is not gated by an invented bound.
  *
- * A match ALWAYS writes — even when no field changed — so `snapshotAt`
- * advances and a delayed intermediate webhook cannot land after a no-op
- * sweep. `eventAt` and `eventId` are copied from current state and never
- * replaced.
+ * A match ALWAYS writes — even when no field changed — and `snapshotAt`
+ * strictly advances so a same-bound overlapping sweep cannot clobber
+ * fresher fields. A delayed intermediate webhook cannot land after a
+ * no-op sweep. `eventAt` and `eventId` are copied from current state and
+ * never replaced.
  *
  * Host-declared `sticky` / `firstWins` fields are enforced on the write
  * against the freshly read row.

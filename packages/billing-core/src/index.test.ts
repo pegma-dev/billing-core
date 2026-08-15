@@ -1708,8 +1708,36 @@ describe("snapshot decider", () => {
     );
     expect(decision).toMatchObject({
       action: "write",
-      value: { snapshotAt: SNAPSHOT_BOUND, eventId: "evt_seed" },
+      value: {
+        snapshotAt: "2026-08-15T16:05:00.001Z",
+        eventId: "evt_seed",
+      },
     });
+  });
+
+  it("strictly advances snapshotAt on a same-bound write so the next CAS drops", () => {
+    const current = record("acct", { snapshotAt: SECOND, plan: "fresh" });
+    const first = decideLedgerSnapshot(
+      current,
+      observeSnapshot(current),
+      snapshot({ plan: "fresh" }),
+      SECOND,
+    );
+    expect(first).toMatchObject({
+      action: "write",
+      value: { snapshotAt: "2026-08-15T16:00:00.001Z", plan: "fresh" },
+    });
+    if (first.action !== "write") {
+      return;
+    }
+    expect(
+      decideLedgerSnapshot(
+        first.value,
+        observeSnapshot(current),
+        snapshot({ plan: "stale-fetch" }),
+        SECOND,
+      ),
+    ).toEqual({ action: "keep", reason: "superseded" });
   });
 
   it("re-evaluates sticky and firstWins against the freshly read row", () => {
@@ -1942,6 +1970,60 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
         eventId: "evt_canceled",
         eventAt: LATER,
         snapshotAt: SECOND,
+      });
+    });
+
+    it("overlapping same-bound sweeps do not clobber fresher fields", async () => {
+      const clock = controllableClock(SECOND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_same_bound",
+        event("evt_seed", { plan: "original" }),
+      );
+      const seeded = await ledger.reconcile("acct_same_bound", async () =>
+        snapshot({ plan: "original" }),
+      );
+      expect(seeded.written).toBe(true);
+      if (!seeded.written) {
+        throw new Error("expected seed snapshot write");
+      }
+      expect(seeded.record.snapshotAt).toBe(SECOND);
+
+      let releaseSlow = () => {};
+      const slowGate = new Promise<void>((resolve) => {
+        releaseSlow = resolve;
+      });
+      let slowStarted = () => {};
+      const slowIsFetching = new Promise<void>((resolve) => {
+        slowStarted = resolve;
+      });
+
+      const slow = ledger.reconcile("acct_same_bound", async () => {
+        slowStarted();
+        await slowGate;
+        return snapshot({ plan: "stale-fetch", status: "active" });
+      });
+      await slowIsFetching;
+
+      const fast = await ledger.reconcile("acct_same_bound", async () =>
+        snapshot({ plan: "fresh-truth", status: "canceled" }),
+      );
+      expect(fast.written).toBe(true);
+      if (!fast.written) {
+        throw new Error("expected fast snapshot write");
+      }
+      expect(fast.record.snapshotAt).toBe("2026-08-15T16:00:00.001Z");
+      releaseSlow();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+      expect(await ledger.get("acct_same_bound")).toMatchObject({
+        plan: "fresh-truth",
+        status: "canceled",
+        eventId: "evt_seed",
+        snapshotAt: "2026-08-15T16:00:00.001Z",
       });
     });
 
