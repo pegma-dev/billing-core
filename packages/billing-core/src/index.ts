@@ -14,9 +14,14 @@ import {
 } from "@pegma/storage-core";
 
 const SAFE_KEY_PART = /^[A-Za-z0-9|_.:@-]{1,256}$/;
+const HOST_FIELD_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const CANONICAL_ISO_TIMESTAMP =
   /^(?:\d{4}|[+-]\d{6})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const LEDGER_ROW_ID = "subscription";
+
+/** Default checkout-reservation lifetime. Abandoned checkouts expire. */
+export const DEFAULT_RESERVATION_TTL_MS = 30 * 60 * 1000;
+const MAX_RESERVATION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Provider-agnostic subscription lifecycle.
@@ -41,6 +46,59 @@ export function lifecycleRank(status: LifecycleStatus): number {
   return LIFECYCLE_RANK[status];
 }
 
+/** Granting statuses are a live subscription for the reservation gate. */
+export function isGrantingStatus(status: LifecycleStatus): boolean {
+  return lifecycleRank(status) === LIFECYCLE_RANK.active;
+}
+
+/** Values a host-declared ledger field may persist. */
+export type HostFieldValue = string | number | boolean | null;
+
+/** Host-declared fields governed by {@link sticky} / {@link firstWins}. */
+export type HostFields = object;
+
+/** A boolean that only ever flips false → true. */
+export interface StickyInvariant {
+  readonly kind: "sticky";
+}
+
+/**
+ * A field or named group whose first write is permanent.
+ *
+ * Fields that share a `group` freeze together: once any member is written,
+ * later events cannot change any member of the group.
+ */
+export interface FirstWinsInvariant {
+  readonly kind: "firstWins";
+  readonly group?: string;
+}
+
+export type FieldInvariant = StickyInvariant | FirstWinsInvariant;
+
+export type LedgerFieldMap = Record<string, FieldInvariant>;
+
+export type HostFromInvariants<TFields extends LedgerFieldMap> = {
+  [K in keyof TFields]: TFields[K] extends StickyInvariant
+    ? boolean
+    : HostFieldValue;
+};
+
+export type LedgerInvariants<THost extends HostFields> = {
+  readonly [K in keyof THost]: FieldInvariant;
+};
+
+/** Declares a one-way boolean flag. */
+export function sticky(): StickyInvariant {
+  return { kind: "sticky" };
+}
+
+/** Declares a first-write-wins field, optionally as part of a named group. */
+export function firstWins(group?: string): FirstWinsInvariant {
+  return group === undefined
+    ? { kind: "firstWins" }
+    : { kind: "firstWins", group };
+}
+
 /**
  * One subscription ledger row per billing account.
  *
@@ -48,7 +106,7 @@ export function lifecycleRank(status: LifecycleStatus): number {
  * boundary: it will not persist card data, raw payloads, line items, or
  * amounts even if a caller casts them onto the value.
  */
-export interface LedgerRecord {
+export interface LedgerFields {
   readonly accountId: string;
   readonly providerCustomerId: string | null;
   readonly providerSubscriptionId: string | null;
@@ -63,10 +121,15 @@ export interface LedgerRecord {
   readonly eventAt: IsoTimestamp | null;
   readonly eventId: string | null;
   readonly snapshotAt: IsoTimestamp | null;
+  readonly reservationId: string | null;
+  readonly reservationExpiresAt: IsoTimestamp | null;
+  readonly offerRedeemed: boolean;
 }
 
+export type LedgerRecord<THost extends HostFields = {}> = LedgerFields & THost;
+
 /** Provider event to apply through the watermark guard and lifecycle rank. */
-export interface LedgerEvent {
+export type LedgerEvent<THost extends HostFields = {}> = {
   readonly eventId: string;
   readonly eventAt: IsoTimestamp;
   readonly status: LifecycleStatus;
@@ -79,31 +142,83 @@ export interface LedgerEvent {
   readonly trialStartAt: IsoTimestamp | null;
   readonly trialEndAt: IsoTimestamp | null;
   readonly cancelAtPeriodEnd: boolean;
-}
+  readonly offerRedeemed?: boolean;
+  readonly fields?: Partial<THost>;
+};
 
 export type IgnoreReason = "redelivery" | "stale" | "equal-rank";
 
-export type ApplicationDecision =
-  | { readonly action: "write"; readonly value: LedgerRecord }
+export type ApplicationDecision<THost extends HostFields = {}> =
+  | { readonly action: "write"; readonly value: LedgerRecord<THost> }
   | { readonly action: "keep"; readonly reason: IgnoreReason };
 
-export interface ApplyResult {
+export interface ApplyResult<THost extends HostFields = {}> {
   readonly applied: boolean;
-  readonly record: LedgerRecord;
+  readonly record: LedgerRecord<THost>;
 }
 
-export interface BillingLedger {
-  get(accountId: string): Promise<LedgerRecord | null>;
-  apply(accountId: string, event: LedgerEvent): Promise<ApplyResult>;
+export type ReserveRefusal = "redeemed" | "subscribed" | "reserved";
+
+export type ReserveDecision<THost extends HostFields = {}> =
+  | { readonly action: "write"; readonly value: LedgerRecord<THost> }
+  | { readonly action: "keep"; readonly reason: ReserveRefusal };
+
+export type ReserveResult =
+  | {
+      readonly reserved: true;
+      readonly reservationId: string;
+      readonly expiresAt: IsoTimestamp;
+    }
+  | { readonly reserved: false; readonly reason: ReserveRefusal };
+
+export interface ReserveOptions {
+  readonly ttlMs?: number;
 }
 
-export interface BillingLedgerOptions {
+export interface ReleaseResult {
+  readonly released: boolean;
+}
+
+export interface BillingLedger<THost extends HostFields = {}> {
+  get(accountId: string): Promise<LedgerRecord<THost> | null>;
+  apply(
+    accountId: string,
+    event: LedgerEvent<THost>,
+  ): Promise<ApplyResult<THost>>;
+  reserve(accountId: string, options?: ReserveOptions): Promise<ReserveResult>;
+  release(accountId: string, reservationId: string): Promise<ReleaseResult>;
+}
+
+export interface BillingLedgerOptions<TFields extends LedgerFieldMap = {}> {
   readonly store: Store;
   readonly clock?: Clock;
   readonly logger?: Logger;
+  readonly newId?: () => string;
+  readonly fields?: TFields;
+  readonly reservationTtlMs?: number;
 }
 
 const LIFECYCLE_STATUSES = new Set<string>(Object.keys(LIFECYCLE_RANK));
+
+const CORE_FIELD_NAMES = new Set<string>([
+  "accountId",
+  "providerCustomerId",
+  "providerSubscriptionId",
+  "providerPriceId",
+  "status",
+  "plan",
+  "periodStartAt",
+  "periodEndAt",
+  "trialStartAt",
+  "trialEndAt",
+  "cancelAtPeriodEnd",
+  "eventAt",
+  "eventId",
+  "snapshotAt",
+  "reservationId",
+  "reservationExpiresAt",
+  "offerRedeemed",
+]);
 
 function assertSafeAccountId(accountId: string): string {
   if (typeof accountId !== "string" || !SAFE_KEY_PART.test(accountId)) {
@@ -121,6 +236,36 @@ function assertSafeEventId(eventId: string): string {
     );
   }
   return eventId;
+}
+
+function assertSafeReservationId(reservationId: string): string {
+  if (typeof reservationId !== "string" || !SAFE_KEY_PART.test(reservationId)) {
+    throw new TypeError(
+      "Unsupported billing reservation id: expected 1-256 safe key characters.",
+    );
+  }
+  return reservationId;
+}
+
+function assertHostFieldNames(fields: LedgerFieldMap | undefined): void {
+  if (fields === undefined) {
+    return;
+  }
+  for (const name of Object.keys(fields)) {
+    if (CORE_FIELD_NAMES.has(name) || !HOST_FIELD_NAME.test(name)) {
+      throw new TypeError(
+        `Unsupported host ledger field ${JSON.stringify(name)}: expected a non-core name matching [A-Za-z][A-Za-z0-9_]{0,63}.`,
+      );
+    }
+  }
+}
+
+function hostFieldKeys<TFields extends LedgerFieldMap>(
+  fields: TFields | undefined,
+): readonly (keyof TFields & string)[] {
+  return fields === undefined
+    ? []
+    : (Object.keys(fields) as (keyof TFields & string)[]);
 }
 
 function canonicalTimestampMilliseconds(timestamp: unknown): number | null {
@@ -195,7 +340,7 @@ function maxSecond(
  * Arrival time is not an input. Unparseable fields do not contribute.
  */
 export function effectiveWatermarkSecond(
-  record: Pick<LedgerRecord, "eventAt" | "snapshotAt">,
+  record: Pick<LedgerFields, "eventAt" | "snapshotAt">,
 ): number | null {
   return maxSecond(record.eventAt, record.snapshotAt);
 }
@@ -229,9 +374,76 @@ function assertNullableString(value: unknown, label: string): string | null {
   return value;
 }
 
-function assertEvent(event: LedgerEvent): LedgerEvent {
+function storedHostValue(value: unknown): StoredValue {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === "boolean" || typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return null;
+}
+
+function isWrittenHostValue(value: HostFieldValue | undefined): boolean {
+  return value !== undefined && value !== null && value !== "";
+}
+
+function assertTtlMs(ttlMs: number): number {
+  if (
+    typeof ttlMs !== "number" ||
+    !Number.isFinite(ttlMs) ||
+    ttlMs <= 0 ||
+    ttlMs > MAX_RESERVATION_TTL_MS
+  ) {
+    throw new TypeError(
+      "Unsupported reservation TTL: expected a positive duration of at most 24 hours.",
+    );
+  }
+  return ttlMs;
+}
+
+function assertClockNow(clock: Clock): IsoTimestamp {
+  const now = clock.now();
+  timestampMilliseconds(now, "billing clock");
+  return now as IsoTimestamp;
+}
+
+function addMilliseconds(timestamp: IsoTimestamp, ms: number): IsoTimestamp {
+  return new Date(
+    timestampMilliseconds(timestamp, "billing clock") + ms,
+  ).toISOString() as IsoTimestamp;
+}
+
+function defaultNewId(): string {
+  const cryptoApi = (
+    globalThis as unknown as {
+      crypto?: { randomUUID?: () => string };
+    }
+  ).crypto;
+  if (cryptoApi?.randomUUID === undefined) {
+    throw new Error(
+      "Billing reservation requires crypto.randomUUID or an injected newId.",
+    );
+  }
+  return cryptoApi.randomUUID();
+}
+
+function requireClock(clock: Clock | undefined): Clock {
+  if (clock === undefined) {
+    throw new TypeError("Billing reservation requires an injected Clock.");
+  }
+  return clock;
+}
+
+function assertEvent<THost extends HostFields>(
+  event: LedgerEvent<THost>,
+): LedgerEvent<THost> {
   assertSafeEventId(event.eventId);
   timestampMilliseconds(event.eventAt, "billing event timestamp");
+  const fields = event.fields;
   return {
     eventId: event.eventId,
     eventAt: event.eventAt,
@@ -254,14 +466,177 @@ function assertEvent(event: LedgerEvent): LedgerEvent {
     trialStartAt: optionalTimestamp(event.trialStartAt, "trial start"),
     trialEndAt: optionalTimestamp(event.trialEndAt, "trial end"),
     cancelAtPeriodEnd: event.cancelAtPeriodEnd === true,
+    ...(event.offerRedeemed === true ? { offerRedeemed: true } : {}),
+    ...(fields === undefined ? {} : { fields }),
   };
 }
 
-function recordFromEvent(
+function blankHostFields<TFields extends LedgerFieldMap>(
+  invariants: TFields | undefined,
+): HostFromInvariants<TFields> {
+  const blank = {} as HostFromInvariants<TFields>;
+  if (invariants === undefined) {
+    return blank;
+  }
+  for (const key of hostFieldKeys(invariants)) {
+    const invariant = invariants[key];
+    if (invariant === undefined) {
+      continue;
+    }
+    (blank as Record<string, HostFieldValue>)[key] =
+      invariant.kind === "sticky" ? false : null;
+  }
+  return blank;
+}
+
+function blankLedgerRecord<TFields extends LedgerFieldMap>(
   accountId: string,
-  event: LedgerEvent,
-  snapshotAt: IsoTimestamp | null,
-): LedgerRecord {
+  invariants: TFields | undefined,
+): LedgerRecord<HostFromInvariants<TFields>> {
+  return {
+    accountId,
+    providerCustomerId: null,
+    providerSubscriptionId: null,
+    providerPriceId: null,
+    status: "incomplete",
+    plan: null,
+    periodStartAt: null,
+    periodEndAt: null,
+    trialStartAt: null,
+    trialEndAt: null,
+    cancelAtPeriodEnd: false,
+    eventAt: null,
+    eventId: null,
+    snapshotAt: null,
+    reservationId: null,
+    reservationExpiresAt: null,
+    offerRedeemed: false,
+    ...blankHostFields(invariants),
+  };
+}
+
+/**
+ * A row created only to hold a reservation has no event watermark yet.
+ * The first provider event must still apply; a corrupt row that already
+ * carries subscription state without a watermark must not.
+ */
+export function isEventlessLedgerRow(
+  record: Pick<
+    LedgerFields,
+    | "eventAt"
+    | "eventId"
+    | "snapshotAt"
+    | "status"
+    | "providerCustomerId"
+    | "providerSubscriptionId"
+    | "providerPriceId"
+    | "plan"
+    | "periodStartAt"
+    | "periodEndAt"
+    | "trialStartAt"
+    | "trialEndAt"
+    | "cancelAtPeriodEnd"
+  >,
+): boolean {
+  return (
+    record.eventAt === null &&
+    record.eventId === null &&
+    record.snapshotAt === null &&
+    record.status === "incomplete" &&
+    record.providerCustomerId === null &&
+    record.providerSubscriptionId === null &&
+    record.providerPriceId === null &&
+    record.plan === null &&
+    record.periodStartAt === null &&
+    record.periodEndAt === null &&
+    record.trialStartAt === null &&
+    record.trialEndAt === null &&
+    record.cancelAtPeriodEnd === false
+  );
+}
+
+function hostValueFromCurrent(
+  current: object | null,
+  key: string,
+  invariant: FieldInvariant,
+): HostFieldValue {
+  if (current === null) {
+    return invariant.kind === "sticky" ? false : null;
+  }
+  return storedHostValue((current as Record<string, unknown>)[key]);
+}
+
+/**
+ * Enforces declared invariants against freshly read state.
+ *
+ * `sticky` keeps a true flag. `firstWins` keeps the first write of a field
+ * or named group. Call this inside a decider so conflict retries re-evaluate.
+ */
+export function applyLedgerInvariants<THost extends HostFields>(
+  current: LedgerRecord<THost> | null,
+  incoming: Partial<THost> | undefined,
+  invariants: LedgerInvariants<THost> | undefined,
+): THost {
+  const next = blankHostFields(invariants) as THost;
+  if (invariants === undefined) {
+    return next;
+  }
+
+  const incomingFields = incoming as Record<string, HostFieldValue> | undefined;
+  const groupKeys = new Map<string, string[]>();
+  for (const key of hostFieldKeys(invariants)) {
+    const invariant = invariants[key];
+    if (invariant === undefined) {
+      continue;
+    }
+    if (invariant.kind === "sticky") {
+      const already = hostValueFromCurrent(current, key, invariant) === true;
+      const incomingValue = incomingFields?.[key];
+      (next as Record<string, HostFieldValue>)[key] =
+        already || incomingValue === true ? true : false;
+      continue;
+    }
+    const group = invariant.group ?? key;
+    const members = groupKeys.get(group) ?? [];
+    members.push(key);
+    groupKeys.set(group, members);
+  }
+
+  for (const members of groupKeys.values()) {
+    const alreadyWritten = members.some((key) =>
+      isWrittenHostValue(
+        hostValueFromCurrent(current, key, { kind: "firstWins" }),
+      ),
+    );
+    for (const key of members) {
+      if (alreadyWritten) {
+        (next as Record<string, HostFieldValue>)[key] = hostValueFromCurrent(
+          current,
+          key,
+          { kind: "firstWins" },
+        );
+        continue;
+      }
+      const incomingValue = incomingFields?.[key];
+      (next as Record<string, HostFieldValue>)[key] =
+        incomingValue === undefined
+          ? hostValueFromCurrent(current, key, { kind: "firstWins" })
+          : storedHostValue(incomingValue);
+    }
+  }
+
+  return next;
+}
+
+function projectAppliedRecord<THost extends HostFields>(
+  current: LedgerRecord<THost> | null,
+  accountId: string,
+  event: LedgerEvent<THost>,
+  invariants: LedgerInvariants<THost> | undefined,
+): LedgerRecord<THost> {
+  const granting = isGrantingStatus(event.status);
+  const offerRedeemed =
+    current?.offerRedeemed === true || granting || event.offerRedeemed === true;
   return {
     accountId,
     providerCustomerId: event.providerCustomerId,
@@ -276,29 +651,40 @@ function recordFromEvent(
     cancelAtPeriodEnd: event.cancelAtPeriodEnd,
     eventAt: event.eventAt,
     eventId: event.eventId,
-    snapshotAt,
-  };
+    snapshotAt: current?.snapshotAt ?? null,
+    reservationId: granting ? null : (current?.reservationId ?? null),
+    reservationExpiresAt: granting
+      ? null
+      : (current?.reservationExpiresAt ?? null),
+    offerRedeemed,
+    ...applyLedgerInvariants(current, event.fields, invariants),
+  } as LedgerRecord<THost>;
 }
 
 /**
  * Decides whether an event may replace the current ledger row.
  *
- * The incoming event applies when there is no row, when its second is
- * strictly newer than `max(eventAt, snapshotAt)`, or when it shares that
- * second and outranks the stored status. Exact redelivery (same event id)
- * is a keep. Equal rank at the equal second drops the later arrival. An
- * existing row with no usable watermark is untrusted: keep, never apply
- * because the event arrived.
+ * The incoming event applies when there is no row, when the row exists only
+ * to hold a reservation, when its second is strictly newer than
+ * `max(eventAt, snapshotAt)`, or when it shares that second and outranks the
+ * stored status. Exact redelivery (same event id) is a keep. Equal rank at
+ * the equal second drops the later arrival. An existing row with no usable
+ * watermark that already carries subscription state is untrusted: keep,
+ * never apply because the event arrived.
+ *
+ * Host-declared `sticky` / `firstWins` fields are enforced on the write
+ * against the freshly read row.
  */
-export function decideLedgerApplication(
-  current: LedgerRecord | null,
+export function decideLedgerApplication<THost extends HostFields = {}>(
+  current: LedgerRecord<THost> | null,
   accountId: string,
-  event: LedgerEvent,
-): ApplicationDecision {
-  if (current === null) {
+  event: LedgerEvent<THost>,
+  invariants?: LedgerInvariants<THost>,
+): ApplicationDecision<THost> {
+  if (current === null || isEventlessLedgerRow(current)) {
     return {
       action: "write",
-      value: recordFromEvent(accountId, event, null),
+      value: projectAppliedRecord(current, accountId, event, invariants),
     };
   }
   if (current.eventId === event.eventId) {
@@ -321,14 +707,77 @@ export function decideLedgerApplication(
 
   return {
     action: "write",
-    value: recordFromEvent(accountId, event, current.snapshotAt),
+    value: projectAppliedRecord(current, accountId, event, invariants),
   };
 }
 
-type EncodedLedgerRecord = Record<keyof LedgerRecord, StoredValue>;
+/**
+ * A reservation is live when it has an id and an unexpired deadline.
+ * Unparseable deadlines do not lock the account.
+ */
+export function reservationIsLive(
+  record: Pick<LedgerFields, "reservationId" | "reservationExpiresAt">,
+  now: IsoTimestamp,
+): boolean {
+  if (record.reservationId == null) {
+    return false;
+  }
+  const expires = canonicalTimestampMilliseconds(record.reservationExpiresAt);
+  const nowMs = canonicalTimestampMilliseconds(now);
+  if (expires === null || nowMs === null) {
+    return false;
+  }
+  return nowMs < expires;
+}
 
-function encodeLedgerRecord(value: LedgerRecord): EncodedLedgerRecord {
+/**
+ * Mints or refuses a checkout reservation against freshly read state.
+ *
+ * `reservationId` is a candidate for this decider run only. The caller must
+ * read the winning id back from the stored record after the write.
+ */
+export function decideReservation<THost extends HostFields = {}>(
+  current: LedgerRecord<THost> | null,
+  accountId: string,
+  now: IsoTimestamp,
+  reservationId: string,
+  expiresAt: IsoTimestamp,
+  invariants?: LedgerInvariants<THost>,
+): ReserveDecision<THost> {
+  const base =
+    current === null
+      ? (blankLedgerRecord(accountId, invariants) as LedgerRecord<THost>)
+      : current;
+  if (base.offerRedeemed) {
+    return { action: "keep", reason: "redeemed" };
+  }
+  if (isGrantingStatus(base.status)) {
+    return { action: "keep", reason: "subscribed" };
+  }
+  if (reservationIsLive(base, now)) {
+    return { action: "keep", reason: "reserved" };
+  }
   return {
+    action: "write",
+    value: {
+      ...base,
+      accountId,
+      reservationId,
+      reservationExpiresAt: expiresAt,
+    },
+  };
+}
+
+type EncodedLedgerRecord<THost extends HostFields> = Record<
+  keyof LedgerFields | keyof THost,
+  StoredValue
+>;
+
+function encodeLedgerRecord<THost extends HostFields>(
+  value: LedgerRecord<THost>,
+  hostKeys: readonly (keyof THost & string)[],
+): EncodedLedgerRecord<THost> {
+  const encoded = {
     accountId: value.accountId,
     providerCustomerId: value.providerCustomerId,
     providerSubscriptionId: value.providerSubscriptionId,
@@ -343,10 +792,28 @@ function encodeLedgerRecord(value: LedgerRecord): EncodedLedgerRecord {
     eventAt: value.eventAt,
     eventId: value.eventId,
     snapshotAt: value.snapshotAt,
-  };
+    reservationId: value.reservationId,
+    reservationExpiresAt: value.reservationExpiresAt,
+    offerRedeemed: value.offerRedeemed,
+  } as EncodedLedgerRecord<THost>;
+  for (const key of hostKeys) {
+    encoded[key] = storedHostValue((value as Record<string, unknown>)[key]);
+  }
+  return encoded;
 }
 
-function decodeLedgerRecord(record: StoredRecord): LedgerRecord {
+function decodeLedgerRecord<THost extends HostFields>(
+  record: StoredRecord,
+  hostKeys: readonly (keyof THost & string)[],
+  invariants: LedgerInvariants<THost> | undefined,
+): LedgerRecord<THost> {
+  const host = blankHostFields(invariants);
+  for (const key of hostKeys) {
+    const invariant = invariants?.[key];
+    const raw = record[key];
+    (host as Record<string, HostFieldValue>)[key] =
+      invariant?.kind === "sticky" ? raw === true : storedHostValue(raw);
+  }
   return {
     accountId: String(record["accountId"] ?? ""),
     providerCustomerId: toNullableString(record["providerCustomerId"]),
@@ -362,7 +829,11 @@ function decodeLedgerRecord(record: StoredRecord): LedgerRecord {
     eventAt: storedTimestamp(record["eventAt"]),
     eventId: toNullableString(record["eventId"]),
     snapshotAt: storedTimestamp(record["snapshotAt"]),
-  };
+    reservationId: toNullableString(record["reservationId"]),
+    reservationExpiresAt: storedTimestamp(record["reservationExpiresAt"]),
+    offerRedeemed: record["offerRedeemed"] === true,
+    ...host,
+  } as LedgerRecord<THost>;
 }
 
 export function billingLedgerKey(accountId: string): EntityKey {
@@ -372,22 +843,37 @@ export function billingLedgerKey(accountId: string): EntityKey {
   };
 }
 
-export function billingLedgerCollection(): CollectionDefinition<LedgerRecord> {
+export function billingLedgerCollection<TFields extends LedgerFieldMap = {}>(
+  fields?: TFields,
+): CollectionDefinition<LedgerRecord<HostFromInvariants<TFields>>> {
+  type THost = HostFromInvariants<TFields>;
+  const invariants = fields as LedgerInvariants<THost> | undefined;
+  assertHostFieldNames(invariants);
+  const hostKeys = hostFieldKeys(invariants) as readonly (keyof THost &
+    string)[];
   return defineCollection({
     name: "billingLedger",
     key: (value) => billingLedgerKey(value.accountId),
     codec: {
-      encode: encodeLedgerRecord,
-      decode: decodeLedgerRecord,
+      encode: (value) => encodeLedgerRecord<THost>(value, hostKeys),
+      decode: (record) =>
+        decodeLedgerRecord<THost>(record, hostKeys, invariants),
     },
   });
 }
 
-export function createBillingLedger(
-  options: BillingLedgerOptions,
-): BillingLedger {
+export function createBillingLedger<TFields extends LedgerFieldMap = {}>(
+  options: BillingLedgerOptions<TFields>,
+): BillingLedger<HostFromInvariants<TFields>> {
+  type THost = HostFromInvariants<TFields>;
   const logger = options.logger ?? noopLogger;
-  const definition = billingLedgerCollection();
+  const newId = options.newId ?? defaultNewId;
+  const invariants = options.fields as LedgerInvariants<THost> | undefined;
+  assertHostFieldNames(invariants);
+  const defaultTtlMs = assertTtlMs(
+    options.reservationTtlMs ?? DEFAULT_RESERVATION_TTL_MS,
+  );
+  const definition = billingLedgerCollection(options.fields);
   const rows = options.store.collection(definition);
 
   return {
@@ -399,7 +885,7 @@ export function createBillingLedger(
       assertSafeAccountId(accountId);
       const incoming = assertEvent(event);
       const result = await rows.update(billingLedgerKey(accountId), (current) =>
-        decideLedgerApplication(current, accountId, incoming),
+        decideLedgerApplication(current, accountId, incoming, invariants),
       );
       if (result.value === null) {
         throw new Error("Billing ledger apply did not persist a record.");
@@ -417,6 +903,88 @@ export function createBillingLedger(
         },
       );
       return { applied, record: result.value };
+    },
+
+    async reserve(accountId, reserveOptions) {
+      assertSafeAccountId(accountId);
+      const clock = requireClock(options.clock);
+      const ttlMs = assertTtlMs(reserveOptions?.ttlMs ?? defaultTtlMs);
+      let refusal: ReserveRefusal | undefined;
+      const result = await rows.update(
+        billingLedgerKey(accountId),
+        (current) => {
+          const now = assertClockNow(clock);
+          const candidateId = assertSafeReservationId(newId());
+          const decision = decideReservation(
+            current,
+            accountId,
+            now,
+            candidateId,
+            addMilliseconds(now, ttlMs),
+            invariants,
+          );
+          if (decision.action === "keep") {
+            refusal = decision.reason;
+            return { action: "keep" as const };
+          }
+          return decision;
+        },
+      );
+      if (result.written) {
+        const stored = result.value;
+        if (
+          stored === null ||
+          stored.reservationId === null ||
+          stored.reservationExpiresAt === null
+        ) {
+          throw new Error(
+            "Billing reservation write did not persist a reservation.",
+          );
+        }
+        logger.log("info", "Billing reservation minted", {
+          accountId,
+          reserved: true,
+        });
+        return {
+          reserved: true,
+          reservationId: stored.reservationId,
+          expiresAt: stored.reservationExpiresAt,
+        };
+      }
+      const reason = refusal ?? "reserved";
+      logger.log("info", "Billing reservation refused", {
+        accountId,
+        reserved: false,
+        reason,
+      });
+      return { reserved: false, reason };
+    },
+
+    async release(accountId, reservationId) {
+      assertSafeAccountId(accountId);
+      assertSafeReservationId(reservationId);
+      const result = await rows.update(
+        billingLedgerKey(accountId),
+        (current) => {
+          if (current === null || current.reservationId !== reservationId) {
+            return { action: "keep" as const };
+          }
+          return {
+            action: "write" as const,
+            value: {
+              ...current,
+              reservationId: null,
+              reservationExpiresAt: null,
+            },
+          };
+        },
+      );
+      const released = result.written;
+      logger.log("info", "Billing reservation released", {
+        accountId,
+        released,
+      });
+      return { released };
     },
   };
 }

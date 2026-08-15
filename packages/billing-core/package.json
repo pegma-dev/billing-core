@@ -1,7 +1,7 @@
 {
   "name": "@pegma/billing-core",
   "version": "0.1.0",
-  "description": "Provider-agnostic subscription ledger: event watermark, effective-watermark guard, and lifecycle-rank arbitration.",
+  "description": "Provider-agnostic subscription ledger: event watermark, lifecycle-rank arbitration, declared invariants, and checkout reservation.",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
