@@ -1775,6 +1775,9 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
         async (observed) => snapshot({ plan: observed.plan }),
       );
       expect(swept.written).toBe(true);
+      if (!swept.written) {
+        throw new Error("expected snapshot write");
+      }
       expect(swept.record.snapshotAt).toBe(SNAPSHOT_BOUND);
       expect(swept.record.eventId).toBe("evt_applied");
       expect(swept.record.eventAt).toBe(EARLIER);
@@ -1873,23 +1876,24 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
       const clock = controllableClock(SECOND);
       const base = freshStore();
       const order: string[] = [];
-      const ledger = createBillingLedger({
-        store: {
-          collection(definition) {
-            const delegate = base.collection(definition);
-            return {
-              ...delegate,
-              async get(key) {
-                order.push("observe");
-                return delegate.get(key);
-              },
-              async update(key, decide, updateOptions) {
-                order.push("update");
-                return delegate.update(key, decide, updateOptions);
-              },
-            };
-          },
+      const tracked: Store = {
+        collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
+          const delegate = base.collection(definition);
+          return {
+            ...delegate,
+            async get(key) {
+              order.push("observe");
+              return delegate.get(key);
+            },
+            async update(key, decide, updateOptions) {
+              order.push("update");
+              return delegate.update(key, decide, updateOptions);
+            },
+          };
         },
+      };
+      const ledger = createBillingLedger({
+        store: tracked,
         clock,
       });
       await ledger.apply("acct_observe_first", event("evt_seed"));
