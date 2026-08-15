@@ -1,6 +1,8 @@
 import {
   createBillingLedger,
   decideLedgerApplication,
+  type ApplicationDecision,
+  type LedgerRecord,
 } from "@pegma/billing-core";
 import { createMemoryStore } from "@pegma/storage-core";
 import { readFileSync } from "node:fs";
@@ -351,9 +353,13 @@ describe("same-second rank through translated Stripe events", () => {
       ["acct_canceled_first", [canceled!, active!]],
       ["acct_active_first", [active!, canceled!]],
     ] as const) {
-      let current = null;
+      let current: LedgerRecord | null = null;
       for (const incoming of order) {
-        const decision = decideLedgerApplication(current, accountId, incoming);
+        const decision: ApplicationDecision = decideLedgerApplication(
+          current,
+          accountId,
+          incoming,
+        );
         if (decision.action === "write") {
           current = decision.value;
         }
