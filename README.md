@@ -9,8 +9,8 @@ maintained correctly under out-of-order webhook delivery.
 
 > [!IMPORTANT]
 > Pegma is in early `0.x` development. `@pegma/billing-core` and
-> `@pegma/billing-stripe` Phase 4 are in-tree and unpublished. No public
-> API is stable.
+> `@pegma/billing-stripe` are published at `0.1.1`. The `0.x` API is
+> unstable.
 
 ## The part everyone gets wrong
 

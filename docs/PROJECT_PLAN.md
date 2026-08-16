@@ -2,8 +2,9 @@
 
 ## Status
 
-**Stage:** Phase 4 — Stripe adapter in-tree. Nothing is
-published. (`0.1.1`, unpublished.)
+**Stage:** Phase 4 — Stripe adapter in-tree.
+`@pegma/billing-core` and `@pegma/billing-stripe` are published at
+`0.1.1`. The `0.x` API is unstable. Phase 5 stays soak-gated.
 
 **Extraction source:** the RetireGolden account API's subscription ledger —
 `api/src/lib/repo.js` (`shouldApplyEvent`, `applySubscriptionSnapshot`,

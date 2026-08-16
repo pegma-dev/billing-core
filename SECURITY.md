@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-This project is in early `0.x` development and is not published yet.
-Security fixes apply to the latest reviewed source until the first
-advertised release of `@pegma/billing-core` and `@pegma/billing-stripe`.
+This project is in early `0.x` development. `@pegma/billing-core` and
+`@pegma/billing-stripe` are published at `0.1.1`; the `0.x` API is
+unstable. Security fixes apply to the latest published versions.
 
 ## Reporting a vulnerability
 
