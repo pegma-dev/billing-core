@@ -103,8 +103,8 @@ Phase 4: `@pegma/billing-core` (ledger collection, `(eventAt, eventId)`
 watermark, effective-watermark guard, lifecycle-rank tie-break, declared
 `sticky` / `firstWins` combinators, checkout reservation, snapshot
 reconciliation) and `@pegma/billing-stripe` (Stripe event and snapshot
-translation). Nothing is published. Phase 5 is the first-consumer
-`repo.js` swap — do not implement that here.
+translation) are published at `0.1.1`. The `0.x` API is unstable. Phase 5
+is the first-consumer `repo.js` swap — do not implement that here.
 
 Siblings: [spine](https://github.com/pegma-dev/spine),
 [storage-core](https://github.com/pegma-dev/storage-core),

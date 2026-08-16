@@ -87,4 +87,4 @@ subscriptions) and Exsimplify (Stripe Checkout today; the adapter still
 translates subscription and event shapes for the ledger). Their private
 account internals stay out of this tree.
 
-Phase 4 is in-tree and unpublished.
+Phase 4 is published at `0.1.1`. The `0.x` API is unstable.
