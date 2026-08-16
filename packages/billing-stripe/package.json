@@ -1,6 +1,6 @@
 {
   "name": "@pegma/billing-stripe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stripe event and snapshot translation for the Pegma billing ledger.",
   "license": "MIT",
   "type": "module",
@@ -29,7 +29,7 @@
     "directory": "packages/billing-stripe"
   },
   "dependencies": {
-    "@pegma/billing-core": "0.1.0",
+    "@pegma/billing-core": "0.1.1",
     "@pegma/spine": "0.1.2"
   },
   "devDependencies": {
@@ -38,6 +38,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "prepack": "pnpm run build"
+    "prepack": "tsc -p tsconfig.json"
   }
 }

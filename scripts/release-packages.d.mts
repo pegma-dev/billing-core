@@ -58,6 +58,8 @@ export function lockDependencyMatches(
 
 export function isNormalReleaseVersion(version: string): boolean;
 
+export function parseNpmJsonStdout(stdout: string): unknown;
+
 export function parseArguments(
   arguments_: readonly string[],
 ): ReleaseCommandOptions;

@@ -8,6 +8,7 @@ import {
   isNormalReleaseVersion,
   lockDependencyMatches,
   parseArguments,
+  parseNpmJsonStdout,
   parsePnpmLockfileImporters,
   resolvedVersionSatisfies,
   validateRepository,
@@ -40,7 +41,7 @@ describe("release package metadata", () => {
     ]);
   });
 
-  it("ships the unpublished 0.1.0 package with exact Pegma pins", () => {
+  it("ships the unpublished 0.1.1 package with exact Pegma pins", () => {
     const manifests = RELEASE_PACKAGES.map(({ directory }) =>
       JSON.parse(
         readFileSync(
@@ -52,17 +53,21 @@ describe("release package metadata", () => {
       name: string;
       version: string;
       dependencies?: Record<string, string>;
+      scripts?: { prepack?: string };
     }>;
 
     expect(manifests.map(({ name, version }) => ({ name, version }))).toEqual([
-      { name: "@pegma/billing-core", version: "0.1.0" },
-      { name: "@pegma/billing-stripe", version: "0.1.0" },
+      { name: "@pegma/billing-core", version: "0.1.1" },
+      { name: "@pegma/billing-stripe", version: "0.1.1" },
     ]);
     expect(manifests[0]?.dependencies?.["@pegma/spine"]).toBe("0.1.2");
     expect(manifests[0]?.dependencies?.["@pegma/storage-core"]).toBe("0.4.0");
-    expect(manifests[1]?.dependencies?.["@pegma/billing-core"]).toBe("0.1.0");
+    expect(manifests[1]?.dependencies?.["@pegma/billing-core"]).toBe("0.1.1");
     expect(manifests[1]?.dependencies?.["@pegma/spine"]).toBe("0.1.2");
-    expect(packageVersion).toBe("0.1.0");
+    expect(packageVersion).toBe("0.1.1");
+    for (const manifest of manifests) {
+      expect(manifest.scripts?.prepack).toBe("tsc -p tsconfig.json");
+    }
   });
 
   it("rejects the bootstrap range from the normal release lane", () => {
@@ -134,7 +139,7 @@ packages:
     expect(
       lockDependencyMatches(
         live["packages/billing-stripe"]?.dependencies?.["@pegma/billing-core"],
-        "0.1.0",
+        "0.1.1",
         { workspace: true },
       ),
     ).toBe(true);
@@ -202,6 +207,55 @@ packages:
     expect(source).toMatch(
       /function runNpm\([\s\S]*?process\.platform === "win32" \? "npm\.cmd" : "npm"/u,
     );
+    expect(source).toMatch(/runNpm\(\["run", "build"\]/u);
+    expect(source).not.toMatch(/runPnpm\(\["run", "build"\]/u);
+  });
+
+  it("does not JSON.parse pnpm's human script banner during prepareRelease", () => {
+    const source = readFileSync(
+      join(process.cwd(), "scripts/release-packages.mjs"),
+      "utf8",
+    );
+    const prepareStart = source.indexOf("export async function prepareRelease");
+    const prepareEnd = source.indexOf(
+      "async function verifyPreparedManifest",
+      prepareStart,
+    );
+    expect(prepareStart).toBeGreaterThanOrEqual(0);
+    expect(prepareEnd).toBeGreaterThan(prepareStart);
+    const prepare = source.slice(prepareStart, prepareEnd);
+    expect(prepare).not.toMatch(/JSON\.parse\(\s*result\.stdout/u);
+    expect(prepare).toMatch(/parseNpmJsonStdout\(\s*result\.stdout/u);
+
+    const banner = `> @pegma/billing-core@0.1.1 build /home/runner/work/billing-core/billing-core/packages/billing-core
+> tsc -p tsconfig.json
+
+`;
+    const packed = [
+      {
+        name: "@pegma/billing-core",
+        version: "0.1.1",
+        filename: "pegma-billing-core-0.1.1.tgz",
+        files: [{ path: "package.json", size: 1 }],
+      },
+    ];
+    expect(() => JSON.parse(banner + JSON.stringify(packed))).toThrow(
+      SyntaxError,
+    );
+    expect(parseNpmJsonStdout(banner + JSON.stringify(packed))).toEqual(packed);
+    expect(parseNpmJsonStdout(JSON.stringify(packed))).toEqual(packed);
+    expect(() => parseNpmJsonStdout(banner)).toThrow("npm did not write JSON");
+  });
+
+  it("parses npm view dist.integrity --json scalar stdout", () => {
+    expect(parseNpmJsonStdout('"sha512-abc"')).toBe("sha512-abc");
+    expect(parseNpmJsonStdout('  "sha512-abc"\n')).toBe("sha512-abc");
+    expect(parseNpmJsonStdout(JSON.stringify("sha512-abc"))).toBe("sha512-abc");
+    expect(parseNpmJsonStdout("0")).toBe(0);
+    expect(parseNpmJsonStdout("-2.5")).toBe(-2.5);
+    expect(parseNpmJsonStdout("true")).toBe(true);
+    expect(parseNpmJsonStdout("false")).toBe(false);
+    expect(parseNpmJsonStdout("null")).toBe(null);
   });
 });
 

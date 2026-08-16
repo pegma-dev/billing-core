@@ -101,11 +101,29 @@ function runNpm(arguments_, options = {}) {
   });
 }
 
-function runPnpm(arguments_, options = {}) {
-  return run(process.platform === "win32" ? "pnpm.cmd" : "pnpm", arguments_, {
-    ...options,
-    shell: process.platform === "win32",
-  });
+/**
+ * `npm --json` writes a JSON value: objects, arrays, or scalars
+ * (`"sha512-…"`, numbers, true/false/null). Lifecycle scripts invoked
+ * during `npm pack` may print a human banner on the same stdout:
+ *   > @pegma/...@0.1.1 build /home/runner/work/...
+ * Drop those `>` lines, then parse from the first JSON token so the
+ * banner is never fed to JSON.parse and `npm view dist.integrity --json`
+ * still yields a string.
+ */
+const JSON_VALUE_START =
+  /[\[{"]|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b/u;
+
+export function parseNpmJsonStdout(stdout) {
+  const text = typeof stdout === "string" ? stdout : "";
+  const withoutBanners = text
+    .split(/\r?\n/u)
+    .filter((line) => !/^\s*>/u.test(line))
+    .join("\n");
+  const start = withoutBanners.search(JSON_VALUE_START);
+  if (start === -1) {
+    fail("npm did not write JSON output");
+  }
+  return JSON.parse(withoutBanners.slice(start));
 }
 
 function unquoteYamlScalar(value) {
@@ -389,7 +407,10 @@ async function validatePackage(root, definition, lockfile) {
   }
   if (
     typeof manifest.scripts?.prepack !== "string" ||
-    !manifest.scripts.prepack.includes("build")
+    !(
+      manifest.scripts.prepack.includes("build") ||
+      manifest.scripts.prepack.includes("tsc")
+    )
   ) {
     fail(`${definition.name} must build during prepack`);
   }
@@ -671,7 +692,7 @@ function queryRegistryIntegrity(name, version) {
     allowFailure: true,
   });
   if (result.status === 0) {
-    const integrity = JSON.parse(result.stdout);
+    const integrity = parseNpmJsonStdout(result.stdout);
     if (typeof integrity !== "string" || integrity.length === 0) {
       fail(`${spec} exists without dist.integrity`);
     }
@@ -716,7 +737,7 @@ export async function prepareRelease(options = {}) {
     fail(`release output directory must be empty: ${output}`);
   }
 
-  runPnpm(["run", "build"], { cwd: root });
+  runNpm(["run", "build"], { cwd: root });
   const records = [];
   const tagVersion = releaseTag?.slice(1);
   for (const { definition, manifest } of packages) {
@@ -730,7 +751,7 @@ export async function prepareRelease(options = {}) {
       ],
       { cwd: root, capture: true },
     );
-    const [packed] = JSON.parse(result.stdout);
+    const [packed] = parseNpmJsonStdout(result.stdout);
     if (
       packed?.name !== definition.name ||
       packed?.version !== manifest.version ||

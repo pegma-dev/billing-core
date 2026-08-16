@@ -3,7 +3,7 @@
 ## Status
 
 **Stage:** Phase 4 — Stripe adapter in-tree. Nothing is
-published. (`0.1.0`, unpublished.)
+published. (`0.1.1`, unpublished.)
 
 **Extraction source:** the RetireGolden account API's subscription ledger —
 `api/src/lib/repo.js` (`shouldApplyEvent`, `applySubscriptionSnapshot`,
