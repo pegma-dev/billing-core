@@ -178,9 +178,9 @@ export interface WatermarkToken {
  * What a sweep observed before fetching provider truth: the watermark
  * identity plus the snapshot freshness bound and write generation.
  *
- * Another reconciliation that lands first increments `snapshotGeneration`
- * without touching the watermark second. Re-checking that generation is
- * what drops the slower, stale fetch.
+ * A reconciliation or redemption-evidence write that lands first increments
+ * `snapshotGeneration` without touching the watermark. Re-checking that
+ * generation is what drops the slower, stale fetch.
  */
 export interface SnapshotObservation extends WatermarkToken {
   readonly snapshotAt: IsoTimestamp | null;
@@ -217,6 +217,10 @@ export type ApplicationDecision<THost extends HostFields = {}> =
   | { readonly action: "keep"; readonly reason: IgnoreReason };
 
 export interface ApplyResult<THost extends HostFields = {}> {
+  /**
+   * Whether the event caused a durable ledger write. A redemption-evidence
+   * write can be applied without advancing the lifecycle watermark.
+   */
   readonly applied: boolean;
   readonly record: LedgerRecord<THost>;
 }
@@ -915,6 +919,35 @@ function projectAppliedRecord<THost extends HostFields>(
   } as LedgerRecord<THost>;
 }
 
+function recordsOfferRedemption(
+  current: Pick<LedgerFields, "offerRedeemed" | "status">,
+  event: Pick<LedgerEvent, "offerRedeemed" | "status">,
+): boolean {
+  return (
+    current.offerRedeemed === false &&
+    (current.status === "canceled" || current.status === "unpaid") &&
+    (event.offerRedeemed === true || isGrantingStatus(event.status))
+  );
+}
+
+function keepOrRecordOfferRedemption<THost extends HostFields>(
+  current: LedgerRecord<THost>,
+  event: LedgerEvent<THost>,
+  reason: IgnoreReason,
+): ApplicationDecision<THost> {
+  if (!recordsOfferRedemption(current, event)) {
+    return { action: "keep", reason };
+  }
+  return {
+    action: "write",
+    value: {
+      ...current,
+      snapshotGeneration: nextSnapshotGeneration(current.snapshotGeneration),
+      offerRedeemed: true,
+    },
+  };
+}
+
 /**
  * Decides whether an event may replace the current ledger row.
  *
@@ -925,6 +958,12 @@ function projectAppliedRecord<THost extends HostFields>(
  * the equal second drops the later arrival. An existing row with no usable
  * watermark that already carries subscription state is untrusted: keep,
  * never apply because the event arrived.
+ *
+ * A distinct event rejected by those ordering rules can still record
+ * monotonic offer-redemption evidence on a terminal row. That write changes
+ * only `offerRedeemed` and `snapshotGeneration`; it does not advance the
+ * lifecycle watermark or copy other incoming fields. The generation change
+ * makes an overlapping snapshot observe the intervening write.
  *
  * Host-declared `sticky` / `firstWins` fields are enforced on the write
  * against the freshly read row.
@@ -948,14 +987,14 @@ export function decideLedgerApplication<THost extends HostFields = {}>(
   const watermark = effectiveWatermarkSecond(current);
   const incoming = timestampSeconds(event.eventAt);
   if (watermark === null || incoming === null) {
-    return { action: "keep", reason: "stale" };
+    return keepOrRecordOfferRedemption(current, event, "stale");
   }
   if (incoming < watermark) {
-    return { action: "keep", reason: "stale" };
+    return keepOrRecordOfferRedemption(current, event, "stale");
   }
   if (incoming === watermark) {
     if (lifecycleRank(event.status) <= lifecycleRank(current.status)) {
-      return { action: "keep", reason: "equal-rank" };
+      return keepOrRecordOfferRedemption(current, event, "equal-rank");
     }
   }
 
@@ -1061,10 +1100,11 @@ function projectSnapshotRecord<THost extends HostFields>(
  *
  * The host must observe {@link SnapshotObservation} first, sample the
  * freshness bound, then fetch provider truth, then call this against
- * freshly read state. A watermark mismatch means an intervening event
- * landed; a `snapshotGeneration` mismatch means another reconciliation
- * already wrote. Either drops the snapshot. A reservation-only /
- * eventless row has no event identity to repair — refuse a `(null, null)`
+ * freshly read state. A watermark mismatch means an intervening lifecycle
+ * event landed; a `snapshotGeneration` mismatch means another
+ * watermark-preserving write already landed. Either drops the snapshot.
+ * A reservation-only or eventless row has no event identity to repair —
+ * refuse a `(null, null)`
  * match so a founding webhook is not gated by an invented bound.
  *
  * A match ALWAYS writes — even when no field changed — and increments
