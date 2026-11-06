@@ -561,17 +561,16 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       });
     });
 
-    it("drops a delayed event that is not strictly newer than max(eventAt, snapshotAt)", async () => {
+    it("records only redemption evidence from a delayed granting event behind snapshotAt", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
-      await rows.put(
-        record("acct_snapshot_bound", {
-          status: "active",
-          eventAt: EARLIER,
-          eventId: "evt_applied",
-          snapshotAt: SNAPSHOT_BOUND,
-        }),
-      );
+      const current = record("acct_snapshot_bound", {
+        status: "active",
+        eventAt: EARLIER,
+        eventId: "evt_applied",
+        snapshotAt: SNAPSHOT_BOUND,
+      });
+      await rows.put(current);
       const ledger = createBillingLedger({ store });
       const delayed = event("evt_delayed_intermediate", {
         eventAt: SECOND,
@@ -580,13 +579,11 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       });
 
       const result = await ledger.apply("acct_snapshot_bound", delayed);
-      expect(result.applied).toBe(false);
-      expect(result.record).toMatchObject({
-        status: "active",
-        eventId: "evt_applied",
-        eventAt: EARLIER,
-        snapshotAt: SNAPSHOT_BOUND,
-        plan: "pro",
+      expect(result.applied).toBe(true);
+      expect(result.record).toEqual({
+        ...current,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
       });
     });
 
@@ -995,7 +992,14 @@ describe("billing ledger codec", () => {
         "acct_unknown_blank",
         event("evt_granting_arrival", { status: "active" }),
       ),
-    ).toEqual({ action: "keep", reason: "stale" });
+    ).toEqual({
+      action: "write",
+      value: {
+        ...decoded,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
+      },
+    });
   });
 
   it("decodes unknown status to incomplete so a corrupt row cannot grant", () => {
@@ -1287,6 +1291,117 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         ...current,
         snapshotGeneration: 8,
         offerRedeemed: true,
+      });
+    });
+
+    it("records stale granting evidence on an incomplete row", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const ledger = createBillingLedger({ store: freshStore(), clock });
+      const current = await ledger.apply(
+        "acct_incomplete_evidence",
+        event("evt_incomplete_current", {
+          eventAt: SECOND,
+          status: "incomplete",
+          plan: "kept",
+        }),
+      );
+
+      const evidence = await ledger.apply(
+        "acct_incomplete_evidence",
+        event("evt_earlier_granting", {
+          eventAt: EARLIER,
+          status: "active",
+          plan: "not-applied",
+        }),
+      );
+
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toEqual({
+        ...current.record,
+        snapshotGeneration: current.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(await ledger.reserve("acct_incomplete_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+    });
+
+    it("records stale redemption evidence after a reservation-only row receives an incomplete event", async () => {
+      const clock = controllableClock(SECOND);
+      const ledger = createBillingLedger({
+        store: freshStore(),
+        clock,
+        newId: () => "rsv_evidence_origin",
+      });
+      const reserved = await ledger.reserve("acct_reserved_evidence");
+      expect(reserved).toMatchObject({
+        reserved: true,
+        reservationId: "rsv_evidence_origin",
+      });
+      const current = await ledger.apply(
+        "acct_reserved_evidence",
+        event("evt_incomplete_current", {
+          eventAt: LATER,
+          status: "incomplete",
+          plan: "kept",
+        }),
+      );
+
+      const evidence = await ledger.apply(
+        "acct_reserved_evidence",
+        event("evt_earlier_explicit", {
+          eventAt: SECOND,
+          status: "incomplete",
+          plan: "not-applied",
+          offerRedeemed: true,
+        }),
+      );
+
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toEqual({
+        ...current.record,
+        snapshotGeneration: current.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(evidence.record.reservationId).toBe("rsv_evidence_origin");
+      expect(await ledger.reserve("acct_reserved_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+    });
+
+    it("records equal-rank same-second redemption evidence", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const ledger = createBillingLedger({ store: freshStore(), clock });
+      const current = await ledger.apply(
+        "acct_equal_rank_evidence",
+        event("evt_incomplete_first", {
+          eventAt: SECOND,
+          status: "incomplete",
+          plan: "kept",
+        }),
+      );
+
+      const evidence = await ledger.apply(
+        "acct_equal_rank_evidence",
+        event("evt_incomplete_evidence", {
+          eventAt: SAME_SECOND_LATER_MS,
+          status: "incomplete",
+          plan: "not-applied",
+          offerRedeemed: true,
+        }),
+      );
+
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toEqual({
+        ...current.record,
+        snapshotGeneration: current.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(await ledger.reserve("acct_equal_rank_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
       });
     });
 
@@ -1593,7 +1708,7 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       });
     });
 
-    it("does not treat a blank decoded corrupt row as reservation-only", async () => {
+    it("records only redemption evidence on a blank decoded row", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
       const decoded = billingLedgerCollection().codec.decode({
@@ -1611,12 +1726,11 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         "acct_unknown_blank",
         event("evt_granting_arrival", { status: "active", plan: "resurrect" }),
       );
-      expect(result.applied).toBe(false);
-      expect(result.record).toMatchObject({
-        status: "incomplete",
-        eventAt: null,
-        eventId: null,
-        plan: null,
+      expect(result.applied).toBe(true);
+      expect(result.record).toEqual({
+        ...decoded,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
       });
     });
 

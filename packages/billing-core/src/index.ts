@@ -32,7 +32,8 @@ export const DEFAULT_SWEEP_LIMIT = 100;
  *
  * Granting states (`trialing`, `active`, `past_due`) outrank the transient
  * `incomplete`. Terminal non-granting states (`unpaid`, `canceled`) outrank
- * granting ones. Equal rank at the equal second drops the later arrival.
+ * granting ones. Equal rank at the equal second keeps the stored lifecycle
+ * fields, while distinct redemption evidence may still be recorded.
  */
 export type LifecycleStatus =
   "incomplete" | "trialing" | "active" | "past_due" | "unpaid" | "canceled";
@@ -920,12 +921,11 @@ function projectAppliedRecord<THost extends HostFields>(
 }
 
 function recordsOfferRedemption(
-  current: Pick<LedgerFields, "offerRedeemed" | "status">,
+  current: Pick<LedgerFields, "offerRedeemed">,
   event: Pick<LedgerEvent, "offerRedeemed" | "status">,
 ): boolean {
   return (
     current.offerRedeemed === false &&
-    (current.status === "canceled" || current.status === "unpaid") &&
     (event.offerRedeemed === true || isGrantingStatus(event.status))
   );
 }
@@ -951,19 +951,19 @@ function keepOrRecordOfferRedemption<THost extends HostFields>(
 /**
  * Decides whether an event may replace the current ledger row.
  *
- * The incoming event applies when there is no row, when the row exists only
- * to hold a reservation, when its second is strictly newer than
- * `max(eventAt, snapshotAt)`, or when it shares that second and outranks the
- * stored status. Exact redelivery (same event id) is a keep. Equal rank at
- * the equal second drops the later arrival. An existing row with no usable
- * watermark that already carries subscription state is untrusted: keep,
- * never apply because the event arrived.
+ * The incoming event replaces lifecycle fields when there is no row, when
+ * the row exists only to hold a reservation, when its second is strictly
+ * newer than `max(eventAt, snapshotAt)`, or when it shares that second and
+ * outranks the stored status. Exact redelivery (same event id) is a keep.
+ * Equal rank at the equal second keeps the stored lifecycle fields. An
+ * existing row with no usable watermark that already carries subscription
+ * state is untrusted, so its lifecycle fields are also kept.
  *
  * A distinct event rejected by those ordering rules can still record
- * monotonic offer-redemption evidence on a terminal row. That write changes
- * only `offerRedeemed` and `snapshotGeneration`; it does not advance the
- * lifecycle watermark or copy other incoming fields. The generation change
- * makes an overlapping snapshot observe the intervening write.
+ * monotonic offer-redemption evidence. That write changes only
+ * `offerRedeemed` and `snapshotGeneration`; it does not advance the lifecycle
+ * watermark or copy other incoming fields. The generation change makes an
+ * overlapping snapshot observe the intervening write.
  *
  * Host-declared `sticky` / `firstWins` fields are enforced on the write
  * against the freshly read row.

@@ -71,15 +71,15 @@ line items, or amounts.
 Arrival order proves nothing. Every apply goes through the effective-watermark
 guard and lifecycle rank. Exact redelivery is an idempotent no-op.
 
-Offer redemption is monotonic across delivery order. A distinct granting
-event, or an event carrying explicit redemption evidence, can record
-`offerRedeemed: true` on a terminal row even when lifecycle ordering rejects
-the rest of that event. The evidence-only write changes only
-`offerRedeemed` and `snapshotGeneration`, preserving the lifecycle watermark,
-`snapshotAt`, and every lifecycle, provider, reservation, and host field. The
-generation change makes an overlapping reconciliation observe the write. In
-that case `applied` is `true` because the event caused a durable ledger write,
-even though its `eventAt` and `eventId` did not become the lifecycle watermark.
+Offer redemption is monotonic across delivery order. When lifecycle ordering
+rejects a distinct event, a granting status or explicit redemption evidence
+still records `offerRedeemed: true` on any row where it is false. The
+evidence-only write changes only `offerRedeemed` and `snapshotGeneration`,
+preserving the lifecycle watermark, `snapshotAt`, and every lifecycle,
+provider, reservation, and host field. The generation change makes an
+overlapping reconciliation observe the write. In that case `applied` is
+`true` because the event caused a durable ledger write, even though its
+`eventAt` and `eventId` did not become the lifecycle watermark.
 
 `sticky` and `firstWins` are declared on the host's ledger definition and
 enforced inside the update decider, so they re-evaluate against fresh state
