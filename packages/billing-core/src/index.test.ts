@@ -181,7 +181,7 @@ function synchronizeFirstTwoUpdates(store: Store): Store {
 }
 
 function trackLedgerStorage(store: Store) {
-  const calls = { update: 0, get: 0 };
+  const calls = { update: 0, write: 0, get: 0 };
   const tracked: Store = {
     collection<T>(definition: CollectionDefinition<T>): CollectionStore<T> {
       const delegate = store.collection(definition);
@@ -193,7 +193,11 @@ function trackLedgerStorage(store: Store) {
         },
         async update(key, decide, options) {
           calls.update += 1;
-          return delegate.update(key, decide, options);
+          const result = await delegate.update(key, decide, options);
+          if (result.written) {
+            calls.write += 1;
+          }
+          return result;
         },
       };
     },
@@ -270,6 +274,138 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
           eventAt: SECOND,
         });
       }
+    });
+
+    it("preserves terminal lifecycle fields while recording earlier or same-second redemption evidence", async () => {
+      const terminalStatuses = ["canceled", "unpaid"] as const;
+      const grantingStatuses = ["trialing", "active", "past_due"] as const;
+      const timings = [
+        ["earlier", EARLIER],
+        ["same_second", SAME_SECOND_LATER_MS],
+      ] as const;
+
+      for (const terminalStatus of terminalStatuses) {
+        for (const grantingStatus of grantingStatuses) {
+          for (const [timing, grantingAt] of timings) {
+            const suffix = `${terminalStatus}_${grantingStatus}_${timing}`;
+            const terminal = event(`evt_terminal_${suffix}`, {
+              eventAt: SECOND,
+              status: terminalStatus,
+              providerCustomerId: "cus_terminal",
+              providerSubscriptionId: "sub_terminal",
+              providerPriceId: "price_terminal",
+              plan: "terminal-plan",
+              periodStartAt: "2026-07-01T00:00:00.000Z",
+              periodEndAt: "2026-08-01T00:00:00.000Z",
+              trialStartAt: "2026-06-01T00:00:00.000Z",
+              trialEndAt: "2026-06-08T00:00:00.000Z",
+              cancelAtPeriodEnd: true,
+            });
+            const granting = event(`evt_granting_${suffix}`, {
+              eventAt: grantingAt,
+              status: grantingStatus,
+              providerCustomerId: "cus_granting",
+              providerSubscriptionId: "sub_granting",
+              providerPriceId: "price_granting",
+              plan: "granting-plan",
+              periodStartAt: "2026-08-01T00:00:00.000Z",
+              periodEndAt: "2026-09-01T00:00:00.000Z",
+              trialStartAt: null,
+              trialEndAt: null,
+              cancelAtPeriodEnd: false,
+            });
+
+            const terminalFirst = createBillingLedger({ store: freshStore() });
+            const beforeEvidence = await terminalFirst.apply(
+              `acct_terminal_first_${suffix}`,
+              terminal,
+            );
+            expect(beforeEvidence.record.offerRedeemed).toBe(false);
+            const afterEvidence = await terminalFirst.apply(
+              `acct_terminal_first_${suffix}`,
+              granting,
+            );
+            expect(afterEvidence.applied).toBe(true);
+            expect(afterEvidence.record).toEqual({
+              ...beforeEvidence.record,
+              snapshotGeneration: beforeEvidence.record.snapshotGeneration + 1,
+              offerRedeemed: true,
+            });
+
+            const grantingFirst = createBillingLedger({ store: freshStore() });
+            await grantingFirst.apply(
+              `acct_granting_first_${suffix}`,
+              granting,
+            );
+            const forward = await grantingFirst.apply(
+              `acct_granting_first_${suffix}`,
+              terminal,
+            );
+            expect({
+              status: afterEvidence.record.status,
+              eventAt: afterEvidence.record.eventAt,
+              eventId: afterEvidence.record.eventId,
+              offerRedeemed: afterEvidence.record.offerRedeemed,
+            }).toEqual({
+              status: forward.record.status,
+              eventAt: forward.record.eventAt,
+              eventId: forward.record.eventId,
+              offerRedeemed: forward.record.offerRedeemed,
+            });
+          }
+        }
+      }
+    });
+
+    it("records explicit redemption evidence once without changing the lifecycle watermark", async () => {
+      const tracked = trackLedgerStorage(freshStore());
+      const ledger = createBillingLedger({ store: tracked.store });
+      const terminal = event("evt_explicit_terminal", {
+        status: "canceled",
+        plan: "kept",
+      });
+      const beforeEvidence = await ledger.apply("acct_explicit", terminal);
+      const writesBeforeEvidence = tracked.calls.write;
+      const evidence = event("evt_explicit_evidence", {
+        eventAt: EARLIER,
+        status: "incomplete",
+        plan: "not-applied",
+        offerRedeemed: true,
+      });
+
+      const recorded = await ledger.apply("acct_explicit", evidence);
+      expect(recorded.applied).toBe(true);
+      expect(recorded.record).toEqual({
+        ...beforeEvidence.record,
+        snapshotGeneration: beforeEvidence.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(tracked.calls.write).toBe(writesBeforeEvidence + 1);
+
+      const writesAfterEvidence = tracked.calls.write;
+      const repeatedEvidence = await ledger.apply("acct_explicit", evidence);
+      expect(repeatedEvidence).toEqual({
+        applied: false,
+        record: recorded.record,
+      });
+      expect(tracked.calls.write).toBe(writesAfterEvidence);
+
+      const exactWatermarkReplay = await ledger.apply(
+        "acct_explicit",
+        event("evt_explicit_terminal", {
+          status: "canceled",
+          plan: "not-applied",
+          offerRedeemed: true,
+        }),
+      );
+      expect(exactWatermarkReplay).toEqual({
+        applied: false,
+        record: recorded.record,
+      });
+      expect(tracked.calls.write).toBe(writesAfterEvidence);
+      expect(exactWatermarkReplay.record.snapshotGeneration).toBe(
+        recorded.record.snapshotGeneration,
+      );
     });
 
     it("same-second active outranks incomplete in both arrival orders", async () => {
@@ -368,7 +504,7 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       });
     });
 
-    it("does not apply onto an existing row whose watermark is missing", async () => {
+    it("records only redemption evidence when a terminal row has no watermark", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
       await rows.put(
@@ -385,13 +521,15 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
         "acct_no_watermark",
         event("evt_granting_arrival", { status: "active", plan: "resurrect" }),
       );
-      expect(result.applied).toBe(false);
+      expect(result.applied).toBe(true);
       expect(result.record).toMatchObject({
         status: "canceled",
         eventAt: null,
         eventId: null,
         snapshotAt: null,
         plan: "kept",
+        snapshotGeneration: 1,
+        offerRedeemed: true,
       });
     });
 
@@ -423,17 +561,16 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       });
     });
 
-    it("drops a delayed event that is not strictly newer than max(eventAt, snapshotAt)", async () => {
+    it("records only redemption evidence from a delayed granting event behind snapshotAt", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
-      await rows.put(
-        record("acct_snapshot_bound", {
-          status: "active",
-          eventAt: EARLIER,
-          eventId: "evt_applied",
-          snapshotAt: SNAPSHOT_BOUND,
-        }),
-      );
+      const current = record("acct_snapshot_bound", {
+        status: "active",
+        eventAt: EARLIER,
+        eventId: "evt_applied",
+        snapshotAt: SNAPSHOT_BOUND,
+      });
+      await rows.put(current);
       const ledger = createBillingLedger({ store });
       const delayed = event("evt_delayed_intermediate", {
         eventAt: SECOND,
@@ -442,13 +579,11 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       });
 
       const result = await ledger.apply("acct_snapshot_bound", delayed);
-      expect(result.applied).toBe(false);
-      expect(result.record).toMatchObject({
-        status: "active",
-        eventId: "evt_applied",
-        eventAt: EARLIER,
-        snapshotAt: SNAPSHOT_BOUND,
-        plan: "pro",
+      expect(result.applied).toBe(true);
+      expect(result.record).toEqual({
+        ...current,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
       });
     });
 
@@ -549,7 +684,7 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       expect(await ledger.get("acct_bad_time")).toBeNull();
     });
 
-    it("logs apply and ignore outcomes without payload or amount fields", async () => {
+    it("logs durable evidence writes as applied without payload or amount fields", async () => {
       const entries: Array<{
         level: string;
         message: string;
@@ -574,7 +709,11 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
       );
       await ledger.apply(
         "acct_logged",
-        event("evt_stale", { eventAt: EARLIER }),
+        event("evt_evidence", { eventAt: EARLIER }),
+      );
+      await ledger.apply(
+        "acct_logged",
+        event("evt_stale", { eventAt: EARLIER, status: "incomplete" }),
       );
 
       expect(entries).toEqual([
@@ -584,6 +723,15 @@ function ledgerConformance(name: string, freshStore: () => Store): void {
           fields: {
             accountId: "acct_logged",
             eventId: "evt_new",
+            applied: true,
+          },
+        },
+        {
+          level: "info",
+          message: "Billing ledger event applied",
+          fields: {
+            accountId: "acct_logged",
+            eventId: "evt_evidence",
             applied: true,
           },
         },
@@ -738,7 +886,7 @@ describe("effective watermark and application decider", () => {
     });
   });
 
-  it("keeps an existing row when the watermark is missing instead of applying by arrival", () => {
+  it("keeps lifecycle fields when recording redemption on a terminal row without a watermark", () => {
     expect(
       decideLedgerApplication(
         record("acct", {
@@ -750,7 +898,16 @@ describe("effective watermark and application decider", () => {
         "acct",
         event("evt_granting_arrival", { status: "active" }),
       ),
-    ).toEqual({ action: "keep", reason: "stale" });
+    ).toMatchObject({
+      action: "write",
+      value: {
+        status: "canceled",
+        eventAt: null,
+        eventId: null,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
+      },
+    });
   });
 
   it("does not consult arrival order when two same-second events differ in rank", () => {
@@ -768,7 +925,15 @@ describe("effective watermark and application decider", () => {
       action: "write",
       value: { status: "canceled", eventId: "evt_canceled" },
     });
-    expect(active).toEqual({ action: "keep", reason: "equal-rank" });
+    expect(active).toMatchObject({
+      action: "write",
+      value: {
+        status: "canceled",
+        eventId: "evt_canceled",
+        snapshotGeneration: 1,
+        offerRedeemed: true,
+      },
+    });
   });
 });
 
@@ -827,7 +992,14 @@ describe("billing ledger codec", () => {
         "acct_unknown_blank",
         event("evt_granting_arrival", { status: "active" }),
       ),
-    ).toEqual({ action: "keep", reason: "stale" });
+    ).toEqual({
+      action: "write",
+      value: {
+        ...decoded,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
+      },
+    });
   });
 
   it("decodes unknown status to incomplete so a corrupt row cannot grant", () => {
@@ -1061,6 +1233,178 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       expect(later.record.consentAt).toBe(stored?.consentAt);
     });
 
+    it("changes only redemption and snapshot generation for stale granting evidence", async () => {
+      const store = freshStore();
+      const rows = store.collection(billingLedgerCollection(HOST_FIELDS));
+      const current = {
+        ...record("acct_evidence_fields", {
+          providerCustomerId: "cus_kept",
+          providerSubscriptionId: "sub_kept",
+          providerPriceId: "price_kept",
+          status: "unpaid",
+          plan: "kept-plan",
+          periodStartAt: "2026-06-01T00:00:00.000Z",
+          periodEndAt: "2026-07-01T00:00:00.000Z",
+          trialStartAt: "2026-05-01T00:00:00.000Z",
+          trialEndAt: "2026-05-08T00:00:00.000Z",
+          cancelAtPeriodEnd: true,
+          eventAt: SECOND,
+          eventId: "evt_terminal_kept",
+          snapshotAt: SNAPSHOT_BOUND,
+          snapshotGeneration: 7,
+          reservationId: "rsv_kept",
+          reservationExpiresAt: LATER,
+          reservationSeeded: true,
+          offerRedeemed: false,
+        }),
+        foundingMember: true,
+        consentAt: EARLIER,
+        consentVersion: "v1",
+      };
+      await rows.put(current);
+      const ledger = createBillingLedger({ store, fields: HOST_FIELDS });
+
+      const result = await ledger.apply(
+        "acct_evidence_fields",
+        event("evt_stale_granting", {
+          eventAt: EARLIER,
+          status: "active",
+          providerCustomerId: "cus_not_applied",
+          providerSubscriptionId: "sub_not_applied",
+          providerPriceId: "price_not_applied",
+          plan: "not-applied",
+          periodStartAt: "2026-08-01T00:00:00.000Z",
+          periodEndAt: "2026-09-01T00:00:00.000Z",
+          trialStartAt: null,
+          trialEndAt: null,
+          cancelAtPeriodEnd: false,
+          fields: {
+            foundingMember: false,
+            consentAt: LATER,
+            consentVersion: "v2",
+          },
+        }),
+      );
+
+      expect(result.applied).toBe(true);
+      expect(result.record).toEqual({
+        ...current,
+        snapshotGeneration: 8,
+        offerRedeemed: true,
+      });
+    });
+
+    it("records stale granting evidence on an incomplete row", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const ledger = createBillingLedger({ store: freshStore(), clock });
+      const current = await ledger.apply(
+        "acct_incomplete_evidence",
+        event("evt_incomplete_current", {
+          eventAt: SECOND,
+          status: "incomplete",
+          plan: "kept",
+        }),
+      );
+
+      const evidence = await ledger.apply(
+        "acct_incomplete_evidence",
+        event("evt_earlier_granting", {
+          eventAt: EARLIER,
+          status: "active",
+          plan: "not-applied",
+        }),
+      );
+
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toEqual({
+        ...current.record,
+        snapshotGeneration: current.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(await ledger.reserve("acct_incomplete_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+    });
+
+    it("records stale redemption evidence after a reservation-only row receives an incomplete event", async () => {
+      const clock = controllableClock(SECOND);
+      const ledger = createBillingLedger({
+        store: freshStore(),
+        clock,
+        newId: () => "rsv_evidence_origin",
+      });
+      const reserved = await ledger.reserve("acct_reserved_evidence");
+      expect(reserved).toMatchObject({
+        reserved: true,
+        reservationId: "rsv_evidence_origin",
+      });
+      const current = await ledger.apply(
+        "acct_reserved_evidence",
+        event("evt_incomplete_current", {
+          eventAt: LATER,
+          status: "incomplete",
+          plan: "kept",
+        }),
+      );
+
+      const evidence = await ledger.apply(
+        "acct_reserved_evidence",
+        event("evt_earlier_explicit", {
+          eventAt: SECOND,
+          status: "incomplete",
+          plan: "not-applied",
+          offerRedeemed: true,
+        }),
+      );
+
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toEqual({
+        ...current.record,
+        snapshotGeneration: current.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(evidence.record.reservationId).toBe("rsv_evidence_origin");
+      expect(await ledger.reserve("acct_reserved_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+    });
+
+    it("records equal-rank same-second redemption evidence", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const ledger = createBillingLedger({ store: freshStore(), clock });
+      const current = await ledger.apply(
+        "acct_equal_rank_evidence",
+        event("evt_incomplete_first", {
+          eventAt: SECOND,
+          status: "incomplete",
+          plan: "kept",
+        }),
+      );
+
+      const evidence = await ledger.apply(
+        "acct_equal_rank_evidence",
+        event("evt_incomplete_evidence", {
+          eventAt: SAME_SECOND_LATER_MS,
+          status: "incomplete",
+          plan: "not-applied",
+          offerRedeemed: true,
+        }),
+      );
+
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toEqual({
+        ...current.record,
+        snapshotGeneration: current.record.snapshotGeneration + 1,
+        offerRedeemed: true,
+      });
+      expect(await ledger.reserve("acct_equal_rank_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+    });
+
     it("mints one reservation and reads the winning id back from storage", async () => {
       const clock = controllableClock(SECOND);
       const minted: string[] = [];
@@ -1119,6 +1463,61 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         expect(stored?.reservationId).toBe(winners[0].reservationId);
         expect(stored?.reservationExpiresAt).toBe(winners[0].expiresAt);
       }
+    });
+
+    it("serializes stale redemption evidence with a concurrent reservation", async () => {
+      const clock = controllableClock(SECOND);
+      const base = freshStore();
+      await createBillingLedger({ store: base }).apply(
+        "acct_evidence_reservation_race",
+        event("evt_terminal", { status: "canceled" }),
+      );
+      let next = 0;
+      const ledger = createBillingLedger({
+        store: synchronizeFirstTwoUpdates(base),
+        clock,
+        newId: () => `rsv_evidence_${(next += 1)}`,
+      });
+
+      const [evidence, reservation] = await Promise.all([
+        ledger.apply(
+          "acct_evidence_reservation_race",
+          event("evt_stale_granting", {
+            eventAt: EARLIER,
+            status: "past_due",
+          }),
+        ),
+        ledger.reserve("acct_evidence_reservation_race"),
+      ]);
+
+      expect(evidence.applied).toBe(true);
+      const stored = await ledger.get("acct_evidence_reservation_race");
+      expect(stored).toMatchObject({
+        status: "canceled",
+        eventAt: SECOND,
+        eventId: "evt_terminal",
+        snapshotGeneration: 1,
+        offerRedeemed: true,
+      });
+      if (reservation.reserved) {
+        expect(stored?.reservationId).toBe(reservation.reservationId);
+        expect(stored?.reservationExpiresAt).toBe(reservation.expiresAt);
+        expect(
+          await ledger.release(
+            "acct_evidence_reservation_race",
+            reservation.reservationId,
+          ),
+        ).toEqual({ released: true });
+        expect(
+          await ledger.get("acct_evidence_reservation_race"),
+        ).toMatchObject({ offerRedeemed: true, reservationId: null });
+      } else {
+        expect(reservation).toEqual({ reserved: false, reason: "redeemed" });
+      }
+      expect(await ledger.reserve("acct_evidence_reservation_race")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
     });
 
     it("refuses when redeemed, live-subscribed, or already reserved", async () => {
@@ -1224,6 +1623,62 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       expect(firstEvent.record.reservationSeeded).toBe(true);
     });
 
+    it("keeps redemption after an initial reservation expires and is released", async () => {
+      const clock = controllableClock(SECOND);
+      const ledger = createBillingLedger({
+        store: freshStore(),
+        clock,
+        reservationTtlMs: 1_000,
+        newId: () => "rsv_initial",
+      });
+      const reserved = await ledger.reserve("acct_expired_evidence");
+      expect(reserved).toEqual({
+        reserved: true,
+        reservationId: "rsv_initial",
+        expiresAt: LATER,
+      });
+      await ledger.apply(
+        "acct_expired_evidence",
+        event("evt_terminal_after_reservation", {
+          eventAt: LATER,
+          status: "unpaid",
+        }),
+      );
+      const evidence = await ledger.apply(
+        "acct_expired_evidence",
+        event("evt_earlier_granting", {
+          eventAt: SECOND,
+          status: "trialing",
+        }),
+      );
+      expect(evidence.record).toMatchObject({
+        status: "unpaid",
+        eventAt: LATER,
+        eventId: "evt_terminal_after_reservation",
+        reservationId: "rsv_initial",
+        reservationExpiresAt: LATER,
+        offerRedeemed: true,
+      });
+
+      clock.advance(1_000);
+      expect(await ledger.reserve("acct_expired_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+      expect(
+        await ledger.release("acct_expired_evidence", "rsv_initial"),
+      ).toEqual({ released: true });
+      expect(await ledger.get("acct_expired_evidence")).toMatchObject({
+        offerRedeemed: true,
+        reservationId: null,
+        reservationExpiresAt: null,
+      });
+      expect(await ledger.reserve("acct_expired_evidence")).toEqual({
+        reserved: false,
+        reason: "redeemed",
+      });
+    });
+
     it("applies the first event onto a reservation-only row and keeps the reservation until granting", async () => {
       const clock = controllableClock(SECOND);
       const ledger = createBillingLedger({ store: freshStore(), clock });
@@ -1253,7 +1708,7 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       });
     });
 
-    it("does not treat a blank decoded corrupt row as reservation-only", async () => {
+    it("records only redemption evidence on a blank decoded row", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
       const decoded = billingLedgerCollection().codec.decode({
@@ -1271,12 +1726,11 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         "acct_unknown_blank",
         event("evt_granting_arrival", { status: "active", plan: "resurrect" }),
       );
-      expect(result.applied).toBe(false);
-      expect(result.record).toMatchObject({
-        status: "incomplete",
-        eventAt: null,
-        eventId: null,
-        plan: null,
+      expect(result.applied).toBe(true);
+      expect(result.record).toEqual({
+        ...decoded,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
       });
     });
 
@@ -1371,7 +1825,7 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
       });
     });
 
-    it("does not apply onto a corrupt canceled row that lacks a watermark", async () => {
+    it("preserves a terminal row without a watermark while recording redemption", async () => {
       const store = freshStore();
       const rows = store.collection(billingLedgerCollection());
       await rows.put(
@@ -1393,11 +1847,13 @@ function invariantsAndReservation(name: string, freshStore: () => Store): void {
         "acct_corrupt_reserved",
         event("evt_granting_arrival", { status: "active", plan: "resurrect" }),
       );
-      expect(result.applied).toBe(false);
+      expect(result.applied).toBe(true);
       expect(result.record).toMatchObject({
         status: "canceled",
         plan: "kept",
         reservationId: "rsv_stale",
+        snapshotGeneration: 1,
+        offerRedeemed: true,
       });
     });
   });
@@ -1918,6 +2374,63 @@ function snapshotReconciliation(name: string, freshStore: () => Store): void {
         plan: "from-event",
         snapshotAt: null,
       });
+    });
+
+    it("drops a snapshot observed before a redemption-evidence write", async () => {
+      const clock = controllableClock(SNAPSHOT_BOUND);
+      const store = freshStore();
+      const ledger = createBillingLedger({ store, clock });
+      await ledger.apply(
+        "acct_evidence_snapshot",
+        event("evt_terminal", {
+          eventAt: SECOND,
+          status: "canceled",
+          plan: "terminal-plan",
+        }),
+      );
+
+      let releaseFetch = () => {};
+      const fetchGate = new Promise<void>((resolve) => {
+        releaseFetch = resolve;
+      });
+      let fetchStarted = () => {};
+      const fetchIsRunning = new Promise<void>((resolve) => {
+        fetchStarted = resolve;
+      });
+      const slow = ledger.reconcile("acct_evidence_snapshot", async () => {
+        fetchStarted();
+        await fetchGate;
+        return snapshot({ status: "active", plan: "stale-snapshot" });
+      });
+      await fetchIsRunning;
+
+      const evidence = await ledger.apply(
+        "acct_evidence_snapshot",
+        event("evt_earlier_granting", {
+          eventAt: EARLIER,
+          status: "active",
+          plan: "not-applied",
+        }),
+      );
+      expect(evidence.applied).toBe(true);
+      expect(evidence.record).toMatchObject({
+        status: "canceled",
+        eventAt: SECOND,
+        eventId: "evt_terminal",
+        plan: "terminal-plan",
+        snapshotAt: null,
+        snapshotGeneration: 1,
+        offerRedeemed: true,
+      });
+
+      releaseFetch();
+      expect(await slow).toMatchObject({
+        written: false,
+        reason: "superseded",
+      });
+      expect(await ledger.get("acct_evidence_snapshot")).toEqual(
+        evidence.record,
+      );
     });
 
     it("no-op still advances snapshotAt", async () => {

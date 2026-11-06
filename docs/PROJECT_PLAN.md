@@ -61,14 +61,19 @@ cross-request CAS token — a DOMAIN token carried in fields, deliberately
 not a storage version, because it must survive across requests and
 processes.
 
-**Effective watermark and lifecycle rank** — an event applies only if
-strictly newer than `max(eventAt, snapshotAt)`. A distinct event sharing
-that exact second is resolved by lifecycle RANK, never delivery order:
-terminal non-granting states outrank granting ones, so a stale `active`
-cannot restore a same-second `canceled`, while a transient `incomplete`
-still loses to a same-second `active`. Equal rank at the equal second
-drops the later arrival — conservative staleness until a strictly newer
-event arrives.
+**Effective watermark and lifecycle rank** — an event replaces lifecycle
+fields when strictly newer than `max(eventAt, snapshotAt)`. A distinct event
+sharing that exact second replaces them only when its lifecycle RANK outranks
+the stored status, never because it arrived later: terminal non-granting
+states outrank granting ones, so a stale `active` cannot restore a same-second
+`canceled`, while a transient `incomplete` still loses to a same-second
+`active`. Equal rank at the equal second keeps the stored lifecycle fields —
+conservative staleness until a strictly newer event arrives. A distinct event
+rejected by these ordering rules can still record monotonic
+`offerRedeemed: true` evidence from a granting status or an explicit flag.
+That evidence-only write preserves the lifecycle watermark and all other
+fields while advancing `snapshotGeneration`; exact redelivery remains an
+idempotent no-op.
 
 **Snapshot reconciliation** — a periodic sweep fetches provider truth
 AFTER observing the watermark, then applies it through a decider that
